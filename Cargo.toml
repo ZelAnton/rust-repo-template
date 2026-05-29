@@ -1,12 +1,12 @@
 [package]
-# TODO: rename to your crate's name (kebab-case, e.g. `my-tool`).
-name = "app"
+# Token-templated — `scripts/init.ps1` substitutes the `__…__` placeholders.
+# See TEMPLATE.md (token table) and docs/AGENT-INIT-GUIDE.md.
+name = "__CrateName__"
 version = "0.1.0"
 edition = "2024"
-# TODO: fill these in for your project.
-description = "TODO: one-line description of this crate"
+description = "__Description__"
 license = "MIT"
-repository = "https://github.com/OWNER/REPO"
+repository = "https://github.com/__GitHubOwner__/__CrateName__"
 readme = "README.md"
 # Pin a Minimum Supported Rust Version if your project needs one, e.g.
 # rust-version = "1.85"  # edition 2024 requires Rust >= 1.85

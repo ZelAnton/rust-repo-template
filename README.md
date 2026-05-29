@@ -2,7 +2,13 @@
 
 A depersonalized baseline for new Rust repositories. It ships the tooling,
 conventions, and AI-agent guidance shared across projects — minus any
-project-specific code, names, or dependency lists.
+project-specific code, names, or dependency lists. It is a **token template**:
+`scripts/init.ps1` stamps your crate name and metadata in.
+
+> **AI agents:** before initializing a repo from this template, read
+> [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md) — a living guide that
+> captures mistakes past initializations made, and that you are expected to
+> extend.
 
 ## What's included
 
@@ -21,17 +27,31 @@ project-specific code, names, or dependency lists.
   from conventional commits.
 - **`.github/workflows/ci.yml`** — build, test, clippy, and `fmt --check` on
   push / pull request.
+- **`LICENSE`** — tokenized MIT (`__Year__`/`__Author__`) matching the `license`
+  field; filled in by the init script.
+- **`scripts/init.ps1`** — one-shot initializer: substitutes the `__…__` tokens,
+  renames token-named files/folders, and removes the template-only docs.
+- **`TEMPLATE.md`** — human usage guide (token table, post-setup checklist);
+  removed on init.
+- **`docs/AGENT-INIT-GUIDE.md`** — agent init guide + a living failure log of
+  mistakes to avoid; removed on init (pitfalls are logged back to the template).
 
 ## Starting a new project from this template
 
-1. **Rename the crate** in `Cargo.toml` (`name`) and fill in `description`,
-   `license`, and `repository`.
-2. **Fill in the `Project` section** of `AGENTS.md`.
-3. **Set your repo URL** in `CHANGELOG.md`'s compare links (replace `OWNER/REPO`)
-   and set the real `0.1.0` date.
-4. **Replace `src/main.rs`** (and `tests/integration.rs`) with your code — or
-   switch to a library crate (`src/lib.rs`) if that's what you're building.
-5. Run `cargo build && cargo test` to confirm a clean baseline.
+Run the init script, then verify:
+
+```pwsh
+pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
+cargo build && cargo test
+```
+
+See **[TEMPLATE.md](TEMPLATE.md)** for the token table, optional pieces, and the
+post-setup checklist; **[docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md)** for
+the agent playbook (including the workspace/multi-crate track).
+
+After initializing, if you hit anything the guide didn't catch, add it to the
+failure log in `docs/AGENT-INIT-GUIDE.md` (in the template) so the next project
+doesn't repeat it.
 
 ## Conventions
 

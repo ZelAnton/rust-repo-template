@@ -2,6 +2,16 @@
 
 This file provides guidance to AI coding agents when working with code in this repository.
 
+## Initializing a new repo from this template
+
+If you are using this repository **as a template** to scaffold a new project,
+read [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md) first — the agent
+playbook (run `scripts/init.ps1`; single-crate and workspace tracks) plus a
+living failure log. [TEMPLATE.md](TEMPLATE.md) has the human-facing token table
+and post-setup checklist. Treat updating the failure log as part of "done": if
+you hit a mistake the guide didn't prevent, add it back to the **template's**
+copy so the next project doesn't repeat it.
+
 ## Project
 
 > **TODO:** Describe this crate — what it does, the binary/library name, and any

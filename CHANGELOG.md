@@ -20,11 +20,10 @@ to a dated version section.
 ### Fixed
 -
 
-## [0.1.0] - YYYY-MM-DD
+## [0.1.0] - __Date__
 
 ### Added
 - Initial project skeleton.
 
-<!-- TODO: replace OWNER/REPO with your repository path. -->
-[Unreleased]: https://github.com/OWNER/REPO/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/OWNER/REPO/releases/tag/v0.1.0
+[Unreleased]: https://github.com/__GitHubOwner__/__CrateName__/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/__GitHubOwner__/__CrateName__/releases/tag/v0.1.0
