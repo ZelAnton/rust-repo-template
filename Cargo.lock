@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "app"
+name = "__CrateName__"
 version = "0.1.0"

@@ -6,8 +6,8 @@ This file provides guidance to AI coding agents when working with code in this r
 
 If you are using this repository **as a template** to scaffold a new project,
 read [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md) first — the agent
-playbook (run `scripts/init.ps1`; single-crate and workspace tracks) plus a
-living failure log. [TEMPLATE.md](TEMPLATE.md) has the human-facing token table
+playbook (run `scripts/init.ps1` or the POSIX `scripts/init.sh`; single-crate
+and workspace tracks) plus a living failure log. [TEMPLATE.md](TEMPLATE.md) has the human-facing token table
 and post-setup checklist. Treat updating the failure log as part of "done": if
 you hit a mistake the guide didn't prevent, add it back to the **template's**
 copy so the next project doesn't repeat it.
@@ -28,6 +28,7 @@ cargo test                  # all unit + integration tests
 cargo test <name>           # run tests matching a substring
 cargo clippy --all-targets  # lint (CI treats warnings as errors)
 cargo fmt                   # format (CI checks `cargo fmt --check`)
+cargo deny check advisories bans   # supply-chain scan (matches CI); see below
 ```
 
 Integration tests live in `tests/` — each file is compiled as its own crate.
@@ -85,9 +86,27 @@ committed.
   bucketing by prefix (`feat`→Added, `fix`→Fixed, `remove`→Removed,
   `perf`/`refactor`/`ci`/…→Changed, `docs`/`chore`/`test`→skipped). Clean
   conventional-commit subjects are what make that fallback useful.
-- This lean template ships **no** release workflow. Add one (e.g. a
-  `workflow_dispatch` GitHub Action that bumps the version, promotes
-  `[Unreleased]`, tags, and publishes) when the project needs automated releases.
+- This template ships an **opt-in** release workflow at
+  `.github/workflows/release.yml.disabled` (a `workflow_dispatch` Action that
+  bumps the version, promotes `[Unreleased]`, tags `v<version>`, and runs
+  `cargo publish`). It is disabled by default — GitHub ignores the `.disabled`
+  extension. Enable it by renaming to `release.yml` and adding the
+  `CRATES_IO_TOKEN` repository secret. For a multi-crate workspace, replace it
+  with per-crate inputs and `<crate>-v<version>` tags (see the workspace track in
+  the agent guide).
+
+## Supply chain and MSRV
+
+- **`cargo deny`.** `deny.toml` configures [cargo-deny](https://embarkstudios.github.io/cargo-deny/);
+  the `cargo-deny` CI job fails on RustSec security advisories, yanked crates,
+  and wildcard version requirements. Run `cargo deny check advisories bans`
+  locally before adding or bumping a dependency. Treat a new alert like a build
+  warning.
+- **MSRV.** `Cargo.toml` `rust-version` is the single source of truth for the
+  Minimum Supported Rust Version; the `msrv` CI job verifies the crate still
+  builds on it. If you raise the floor (adopt a newer language/std feature),
+  update both `rust-version` and that job's pinned toolchain together.
+  `rust-toolchain.toml` separately pins everyday builds to `stable` + rustfmt/clippy.
 
 ## Version control workflow
 

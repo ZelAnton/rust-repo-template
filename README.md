@@ -3,7 +3,8 @@
 A depersonalized baseline for new Rust repositories. It ships the tooling,
 conventions, and AI-agent guidance shared across projects — minus any
 project-specific code, names, or dependency lists. It is a **token template**:
-`scripts/init.ps1` stamps your crate name and metadata in.
+`scripts/init.ps1` (or the POSIX `scripts/init.sh`) stamps your crate name and
+metadata in.
 
 > **AI agents:** before initializing a repo from this template, read
 > [docs/AGENT-INIT-GUIDE.md](docs/AGENT-INIT-GUIDE.md) — a living guide that
@@ -21,15 +22,26 @@ project-specific code, names, or dependency lists. It is a **token template**:
   checklist into the agent's context each turn.
 - **`.gitattributes`** — LF line-ending normalization (keeps git and colocated
   `jj` agreeing on the working copy, especially on Windows).
+- **`.editorconfig`** — editor defaults (LF, final newline, trim trailing) for
+  the non-Rust files rustfmt doesn't touch (`.toml`, `.yml`, `.md`, `.sh`).
 - **`.gitignore`** — `/target`, per-user scratch files, and the `.claude/`
   carve-out (ships hook config, excludes the per-user `settings.local.json`).
 - **`cliff.toml`** + **`CHANGELOG.md`** — Keep a Changelog + git-cliff auto-fill
   from conventional commits.
-- **`.github/workflows/ci.yml`** — build, test, clippy, and `fmt --check` on
-  push / pull request.
+- **`.github/workflows/ci.yml`** — `fmt --check`, clippy (`-D warnings`), build +
+  test on Linux/Windows, a `cargo-deny` supply-chain scan, and an MSRV check —
+  with `Swatinem/rust-cache` and concurrency-cancel so reruns are fast.
+- **`.github/workflows/release.yml.disabled`** — an opt-in single-crate
+  crates.io publish workflow (bump → promote changelog → tag → publish). Rename
+  to `release.yml` and set `CRATES_IO_TOKEN` to enable.
+- **`deny.toml`** — cargo-deny config (security advisories + banned/duplicate
+  crates) gated by the `cargo-deny` CI job.
+- **`rust-toolchain.toml`** — pins the toolchain to `stable` with rustfmt/clippy;
+  the MSRV lives in `Cargo.toml` (`rust-version`).
 - **`LICENSE`** — tokenized MIT (`__Year__`/`__Author__`) matching the `license`
   field; filled in by the init script.
-- **`scripts/init.ps1`** — one-shot initializer: substitutes the `__…__` tokens,
+- **`scripts/init.ps1`** / **`scripts/init.sh`** — one-shot initializer (PowerShell
+  and POSIX; run whichever fits your shell): substitutes the `__…__` tokens,
   renames token-named files/folders, and removes the template-only docs.
 - **`TEMPLATE.md`** — human usage guide (token table, post-setup checklist);
   removed on init.
@@ -42,6 +54,13 @@ Run the init script, then verify:
 
 ```pwsh
 pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
+cargo build && cargo test
+```
+
+On a POSIX shell (Linux/macOS, or git-bash) use the equivalent:
+
+```bash
+bash ./scripts/init.sh --crate-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
 cargo build && cargo test
 ```
 

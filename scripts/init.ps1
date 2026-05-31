@@ -4,10 +4,13 @@
     Initializes this template into a concrete Rust project.
 
 .DESCRIPTION
+    POSIX counterpart: scripts/init.sh — use whichever matches your shell.
+
     Replaces the placeholder tokens (__CrateName__, __Author__, __GitHubOwner__,
     __Description__, __Year__, __Date__) in file contents AND in file/folder
     names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — this script itself).
+    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
+    init.ps1 and init.sh).
 
     Run it once, right after creating a repository from the template:
 
@@ -36,7 +39,8 @@
     Release date for the CHANGELOG 0.1.0 entry (YYYY-MM-DD). Defaults to today.
 
 .PARAMETER KeepScript
-    Keep this script after running (TEMPLATE.md is removed either way).
+    Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
+    docs/AGENT-INIT-GUIDE.md are removed either way.
 
 .EXAMPLE
     pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
@@ -100,9 +104,12 @@ function Test-Excluded([string]$fullPath) {
 
 Write-Host "==> Initializing template as '$CrateName'" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents (this script is left untouched).
+# 1) Replace tokens in file contents. Both initializers are skipped: they carry
+#    the literal token strings as search keys, so substituting inside them would
+#    corrupt the sibling script.
+$siblingSh = Join-Path $PSScriptRoot 'init.sh'
 $files = Get-ChildItem -Path $repoRoot -File -Recurse | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath
+    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
 }
 $contentChanged = 0
 foreach ($file in $files) {
@@ -165,6 +172,8 @@ Write-Host "  4. Replace src/main.rs (and tests/integration.rs) with your code,"
 Write-Host "     or switch to a library crate (src/lib.rs)."
 Write-Host "  5. Fill the Project section of AGENTS.md, then commit."
 
+# Remove both initializers unless asked to keep them.
 if (-not $KeepScript) {
+    if (Test-Path $siblingSh) { Remove-Item -LiteralPath $siblingSh -Force }
     Remove-Item -LiteralPath $selfPath -Force
 }

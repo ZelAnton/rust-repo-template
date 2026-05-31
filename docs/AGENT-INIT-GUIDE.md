@@ -15,9 +15,10 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 
 1. **Read before you write.** Read `TEMPLATE.md`, this file, `AGENTS.md`, and
    `CLAUDE.md` *first*. Do not generate a single file based on an assumed layout.
-2. **Prefer the init script over hand-rolling.** `scripts/init.ps1` is the
-   supported path for a standard single-crate init. Run it; don't recreate its
-   token substitution by hand.
+2. **Prefer the init script over hand-rolling.** `scripts/init.ps1` (PowerShell)
+   and `scripts/init.sh` (POSIX) are the supported path for a standard
+   single-crate init — run whichever fits your shell. Don't recreate their token
+   substitution by hand.
 3. **Match the shell to the tool.** On Windows the Bash tool is POSIX (git bash);
    PowerShell cmdlets fail there with `command not found`. Use the PowerShell
    tool for `pwsh`/cmdlets, the Bash tool only for POSIX. Prefer the dedicated
@@ -36,17 +37,23 @@ Confirm these facts by reading, not by assuming:
 - It is a **token template**, not a ready project. Placeholder tokens
   (`__CrateName__`, `__Author__`, `__GitHubOwner__`, `__Description__`,
   `__Year__`, `__Date__`) appear in file contents (and may appear in file/folder
-  names in workspace adaptations). `scripts/init.ps1` substitutes them.
+  names in workspace adaptations). `scripts/init.ps1` (or the POSIX
+  `scripts/init.sh`) substitutes them.
 - It is **single-crate** by default: a binary crate (`src/main.rs`) with an
   integration test (`tests/integration.rs`), edition 2024.
 - Conventions (all enforced — see `AGENTS.md`):
   - CI is strict: `cargo fmt --all --check`, `cargo clippy --all-targets
-    -- -D warnings` (warnings are errors), build + test on Linux **and** Windows.
+    -- -D warnings` (warnings are errors), build + test on Linux **and** Windows,
+    a `cargo-deny` supply-chain scan (`deny.toml`), and an MSRV check.
   - Every dependency gets a "why" comment in `Cargo.toml`; `Cargo.lock` is
     committed; no fixed allow-list of crates.
+  - MSRV is `Cargo.toml` `rust-version` (verified by the `msrv` CI job);
+    `rust-toolchain.toml` pins everyday builds to `stable` + rustfmt/clippy.
   - `CHANGELOG.md` is Keep a Changelog; manual bullets win over the git-cliff
-    (`cliff.toml`) auto-fill keyed on conventional-commit subjects.
-  - LF line endings via `.gitattributes` (`* text=auto eol=lf`).
+    (`cliff.toml`) auto-fill keyed on conventional-commit subjects. Releases are
+    opt-in: `.github/workflows/release.yml.disabled` (rename to enable).
+  - LF line endings via `.gitattributes` (`* text=auto eol=lf`); `.editorconfig`
+    covers editor defaults for non-Rust files.
 - It uses **jujutsu (`jj`)** colocated with git. Drive VCS through `jj`.
 
 ## The happy path (standard single-crate init)
@@ -58,10 +65,17 @@ Confirm these facts by reading, not by assuming:
    pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
    ```
 
-   `-CrateName` is required; the rest fall back to sensible defaults. The script
-   substitutes tokens (TOML-escaped for `Cargo.toml`), renames any token-named
-   files/folders, and deletes `TEMPLATE.md`, `docs/AGENT-INIT-GUIDE.md`, and
-   itself (unless `-KeepScript`).
+   On a POSIX shell, run `scripts/init.sh` instead (same behavior, flag syntax):
+
+   ```bash
+   bash ./scripts/init.sh --crate-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
+   ```
+
+   The crate name is required; the rest fall back to sensible defaults. The
+   script substitutes tokens (TOML-escaped for `Cargo.toml`), renames any
+   token-named files/folders, and deletes `TEMPLATE.md`,
+   `docs/AGENT-INIT-GUIDE.md`, and both initializers (unless `-KeepScript` /
+   `--keep-script`). Run **one** initializer, not both.
 3. **Verify**:
 
    ```pwsh
@@ -141,6 +155,18 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-05-31 — second initializer corrupted by the first
+- **Symptom:** When a POSIX `scripts/init.sh` was added next to `init.ps1`, running
+  either initializer rewrote the *other's* literal token strings (`__CrateName__`
+  etc. are the search keys both scripts contain), leaving a broken sibling script
+  behind in the downstream repo.
+- **Root cause:** The content-substitution pass excluded only the running script,
+  not the other initializer.
+- **Rule:** Both initializers skip **both** init scripts during content
+  replacement, and (unless `-KeepScript` / `--keep-script`) delete both on
+  completion. A downstream repo keeps zero initializers. If you add a third
+  scaffolding script that embeds these tokens, exclude it the same way.
 
 ### 2026-05-29 — `LICENSE` declared but never shipped
 - **Symptom:** A workspace was initialized whose crates set `license = "MIT"` but

@@ -20,7 +20,13 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
    ```
 
-   `-CrateName` is required; the rest are optional and fall back to sensible
+   On a POSIX shell (Linux/macOS, or git-bash) run the equivalent instead:
+
+   ```bash
+   bash ./scripts/init.sh --crate-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
+   ```
+
+   The crate name is required; the rest are optional and fall back to sensible
    defaults (`git config user.name`, `your-org`, a TODO description, the current
    year, today's date). The script:
    - replaces the placeholder tokens in every file's contents (TOML values are
@@ -30,7 +36,7 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    - activates `.claude/settings.json` from a `.template` if one is shipped
      (the default settings is an active, hook-only file — nothing to activate);
    - deletes this `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, and (unless
-     `-KeepScript`) itself.
+     `-KeepScript` / `--keep-script`) both initializers (`init.ps1` and `init.sh`).
 3. Verify:
 
    ```pwsh
@@ -68,5 +74,10 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
 - [ ] `Cargo.toml` metadata (`description`, `repository`) filled in / correct.
 - [ ] `repository` URL matches the real remote (`git remote get-url origin`).
 - [ ] `CHANGELOG.md` `0.1.0` date and compare links correct.
+- [ ] `Cargo.toml` `rust-version` (MSRV) is right; keep it in sync with the
+      `msrv` CI job's pinned toolchain in `.github/workflows/ci.yml`.
 - [ ] `AGENTS.md` `Project` section written for your crate.
 - [ ] Branch protection / required checks configured for `main` (CI).
+- [ ] If you publish to crates.io: enable releases by renaming
+      `.github/workflows/release.yml.disabled` → `release.yml` and adding the
+      `CRATES_IO_TOKEN` repository secret.
