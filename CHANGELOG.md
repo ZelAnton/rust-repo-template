@@ -12,7 +12,7 @@ to a dated version section.
 ## [Unreleased]
 
 ### Added
--
+- Initial project skeleton.
 
 ### Changed
 -
@@ -20,10 +20,4 @@ to a dated version section.
 ### Fixed
 -
 
-## [0.1.0] - __Date__
-
-### Added
-- Initial project skeleton.
-
-[Unreleased]: https://github.com/__GitHubOwner__/__CrateName__/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/__GitHubOwner__/__CrateName__/releases/tag/v0.1.0
+[Unreleased]: https://github.com/__GitHubOwner__/__CrateName__/commits/HEAD

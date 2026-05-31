@@ -36,7 +36,7 @@ Confirm these facts by reading, not by assuming:
 
 - It is a **token template**, not a ready project. Placeholder tokens
   (`__CrateName__`, `__Author__`, `__GitHubOwner__`, `__Description__`,
-  `__Year__`, `__Date__`) appear in file contents (and may appear in file/folder
+  `__Year__`) appear in file contents (and may appear in file/folder
   names in workspace adaptations). `scripts/init.ps1` (or the POSIX
   `scripts/init.sh`) substitutes them.
 - It is **single-crate** by default: a binary crate (`src/main.rs`) with an
@@ -189,8 +189,10 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
 - **Symptom:** The `repository` URL and `CHANGELOG` date/compare links carried
   literal placeholders that were almost shipped.
 - **Root cause:** Hand-editing placeholders is error-prone.
-- **Rule:** These are now tokens (`__GitHubOwner__`, `__CrateName__`, `__Date__`)
-  that `scripts/init.ps1` substitutes; the URL default comes from `git remote`.
+- **Rule:** These are now tokens (`__GitHubOwner__`, `__CrateName__`) that
+  `scripts/init.ps1` substitutes; the URL default comes from `git remote`. The
+  `CHANGELOG.md` release date and compare links are filled by the release
+  workflow on release, not by init.
 
 ### 2026-05-29 — workspace built from scratch with no guidance
 - **Symptom:** Converting the single-crate skeleton into a multi-crate,

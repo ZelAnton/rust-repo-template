@@ -4,14 +4,14 @@
 # init.ps1 — use whichever matches your shell; both do the same thing).
 #
 # Replaces the placeholder tokens (__CrateName__, __Author__, __GitHubOwner__,
-# __Description__, __Year__, __Date__) in file contents AND in file/folder names,
+# __Description__, __Year__) in file contents AND in file/folder names,
 # then removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md)
 # and — unless --keep-script — both initializers (init.sh and init.ps1).
 #
 # Usage:
 #   bash ./scripts/init.sh --crate-name my-tool \
 #       [--author "Jane Doe"] [--github-owner acme] [--description "A small tool"] \
-#       [--year 2026] [--date 2026-01-31] [--keep-script]
+#       [--year 2026] [--keep-script]
 #
 # --crate-name is required; the rest fall back to sensible defaults so the
 # result always builds. Edit LICENSE / Cargo.toml afterwards to refine them.
@@ -23,7 +23,6 @@ author=""
 github_owner=""
 description=""
 year=""
-date_str=""
 keep_script=0
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -35,7 +34,6 @@ while [ $# -gt 0 ]; do
     --github-owner) github_owner="${2:-}"; shift 2 ;;
     --description)  description="${2:-}"; shift 2 ;;
     --year)         year="${2:-}"; shift 2 ;;
-    --date)         date_str="${2:-}"; shift 2 ;;
     --keep-script)  keep_script=1; shift ;;
     -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
@@ -61,7 +59,6 @@ fi
 [ -n "$github_owner" ] || github_owner="your-org"
 [ -n "$description" ]  || description="TODO: crate description"
 [ -n "$year" ]         || year="$(date +%Y)"
-[ -n "$date_str" ]     || date_str="$(date +%F)"
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
@@ -77,7 +74,6 @@ owner_t="$(toml_escape "$github_owner")"
 desc_t="$(toml_escape "$description")"
 crate_t="$(toml_escape "$crate_name")"
 year_t="$(toml_escape "$year")"
-date_t="$(toml_escape "$date_str")"
 
 echo "==> Initializing template as '$crate_name'"
 
@@ -90,8 +86,8 @@ while IFS= read -r -d '' file; do
     "$self"|"$sibling_ps1") continue ;;
   esac
   case "$file" in
-    *.toml) c=$crate_t; a=$author_t; o=$owner_t; d=$desc_t; y=$year_t; dt=$date_t ;;
-    *)      c=$crate_name; a=$author; o=$github_owner; d=$description; y=$year; dt=$date_str ;;
+    *.toml) c=$crate_t; a=$author_t; o=$owner_t; d=$desc_t; y=$year_t ;;
+    *)      c=$crate_name; a=$author; o=$github_owner; d=$description; y=$year ;;
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
@@ -101,7 +97,6 @@ while IFS= read -r -d '' file; do
   content="${content//__GitHubOwner__/$o}"
   content="${content//__Description__/$d}"
   content="${content//__Year__/$y}"
-  content="${content//__Date__/$dt}"
   if [ "$content" != "$orig" ]; then
     printf '%s' "$content" > "$file"
     changed=$((changed + 1))

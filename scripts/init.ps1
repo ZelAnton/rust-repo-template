@@ -7,7 +7,7 @@
     POSIX counterpart: scripts/init.sh — use whichever matches your shell.
 
     Replaces the placeholder tokens (__CrateName__, __Author__, __GitHubOwner__,
-    __Description__, __Year__, __Date__) in file contents AND in file/folder
+    __Description__, __Year__) in file contents AND in file/folder
     names, then removes the template-only files (TEMPLATE.md,
     docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
     init.ps1 and init.sh).
@@ -35,9 +35,6 @@
 .PARAMETER Year
     Copyright year. Defaults to the current year.
 
-.PARAMETER Date
-    Release date for the CHANGELOG 0.1.0 entry (YYYY-MM-DD). Defaults to today.
-
 .PARAMETER KeepScript
     Keep both initializers (init.ps1 and init.sh) after running. TEMPLATE.md and
     docs/AGENT-INIT-GUIDE.md are removed either way.
@@ -53,7 +50,6 @@ param(
     [string]$GitHubOwner,
     [string]$Description,
     [int]$Year = (Get-Date).Year,
-    [string]$Date = (Get-Date).ToString('yyyy-MM-dd'),
     [switch]$KeepScript
 )
 
@@ -80,7 +76,6 @@ $replacements = [ordered]@{
     '__GitHubOwner__' = $GitHubOwner
     '__Description__'  = $Description
     '__Year__'        = "$Year"
-    '__Date__'        = $Date
 }
 
 # Values written into TOML files (Cargo.toml description/repository) sit inside

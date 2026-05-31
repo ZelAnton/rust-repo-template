@@ -87,10 +87,15 @@ committed.
   `perf`/`refactor`/`ci`/…→Changed, `docs`/`chore`/`test`→skipped). Clean
   conventional-commit subjects are what make that fallback useful.
 - This template ships an **opt-in** release workflow at
-  `.github/workflows/release.yml.disabled` (a `workflow_dispatch` Action that
-  bumps the version, promotes `[Unreleased]`, tags `v<version>`, and runs
-  `cargo publish`). It is disabled by default — GitHub ignores the `.disabled`
-  extension. Enable it by renaming to `release.yml` and adding the
+  `.github/workflows/release.yml.disabled`. It is a **manual** (`workflow_dispatch`)
+  Action with no push/tag trigger, so renaming the file to enable it never
+  auto-releases. You pick a `patch` / `minor` / `major` bump from a menu; the next
+  version is **computed** from `Cargo.toml` (never typed by hand) — the first
+  release (no `v*` tag yet) ships the current version as-is. The workflow then
+  auto-fills an empty `[Unreleased]` via git-cliff, promotes the changelog, commits
+  the bump, tags `v<version>`, publishes a **GitHub Release** with the curated
+  notes, and runs `cargo publish`. It is disabled by default — GitHub ignores the
+  `.disabled` extension. Enable it by renaming to `release.yml` and adding the
   `CRATES_IO_TOKEN` repository secret. For a multi-crate workspace, replace it
   with per-crate inputs and `<crate>-v<version>` tags (see the workspace track in
   the agent guide).

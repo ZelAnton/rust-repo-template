@@ -28,7 +28,7 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 
    The crate name is required; the rest are optional and fall back to sensible
    defaults (`git config user.name`, `your-org`, a TODO description, the current
-   year, today's date). The script:
+   year). The script:
    - replaces the placeholder tokens in every file's contents (TOML values are
      escaped for `Cargo.toml`);
    - renames any token-named files/folders (none in the single-crate skeleton,
@@ -58,7 +58,6 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 | `__GitHubOwner__` | GitHub owner/org in repository URLs |
 | `__Description__` | crate description (`Cargo.toml`) |
 | `__Year__` | copyright year (LICENSE) |
-| `__Date__` | `CHANGELOG.md` `0.1.0` release date |
 
 ## Multi-crate / workspace projects
 
@@ -73,7 +72,8 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
 - [ ] `LICENSE` author/year and license choice reviewed.
 - [ ] `Cargo.toml` metadata (`description`, `repository`) filled in / correct.
 - [ ] `repository` URL matches the real remote (`git remote get-url origin`).
-- [ ] `CHANGELOG.md` `0.1.0` date and compare links correct.
+- [ ] `CHANGELOG.md` `[Unreleased]` reflects your starting state (the release
+      workflow dates it and fills the compare links on release).
 - [ ] `Cargo.toml` `rust-version` (MSRV) is right; keep it in sync with the
       `msrv` CI job's pinned toolchain in `.github/workflows/ci.yml`.
 - [ ] `AGENTS.md` `Project` section written for your crate.
