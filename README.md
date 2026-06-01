@@ -31,9 +31,10 @@ metadata in.
 - **`.github/workflows/ci.yml`** — `fmt --check`, clippy (`-D warnings`), build +
   test on Linux/Windows, a `cargo-deny` supply-chain scan, and an MSRV check —
   with `Swatinem/rust-cache` and concurrency-cancel so reruns are fast.
-- **`.github/workflows/release.yml.disabled`** — an opt-in single-crate
-  crates.io publish workflow (bump → promote changelog → tag → publish). Rename
-  to `release.yml` and set `CRATES_IO_TOKEN` to enable.
+- **`.github/workflows/release.yml`** — a manual (`workflow_dispatch`)
+  single-crate crates.io publish workflow (pick a bump → promote changelog →
+  dry-run gate → tag → GitHub Release → publish). Set the `CRATES_IO_TOKEN`
+  secret before running it.
 - **`deny.toml`** — cargo-deny config (security advisories + banned/duplicate
   crates) gated by the `cargo-deny` CI job.
 - **`rust-toolchain.toml`** — pins the toolchain to `stable` with rustfmt/clippy;

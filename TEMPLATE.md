@@ -78,6 +78,6 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
       `msrv` CI job's pinned toolchain in `.github/workflows/ci.yml`.
 - [ ] `AGENTS.md` `Project` section written for your crate.
 - [ ] Branch protection / required checks configured for `main` (CI).
-- [ ] If you publish to crates.io: enable releases by renaming
-      `.github/workflows/release.yml.disabled` → `release.yml` and adding the
-      `CRATES_IO_TOKEN` repository secret.
+- [ ] If you publish to crates.io: add the `CRATES_IO_TOKEN` repository secret
+      (the release workflow `.github/workflows/release.yml` is already enabled;
+      it is manual-only and won't run until you dispatch it).

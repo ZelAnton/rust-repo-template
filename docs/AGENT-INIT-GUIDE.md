@@ -50,8 +50,9 @@ Confirm these facts by reading, not by assuming:
   - MSRV is `Cargo.toml` `rust-version` (verified by the `msrv` CI job);
     `rust-toolchain.toml` pins everyday builds to `stable` + rustfmt/clippy.
   - `CHANGELOG.md` is Keep a Changelog; manual bullets win over the git-cliff
-    (`cliff.toml`) auto-fill keyed on conventional-commit subjects. Releases are
-    opt-in: `.github/workflows/release.yml.disabled` (rename to enable).
+    (`cliff.toml`) auto-fill keyed on conventional-commit subjects. Releases run
+    via `.github/workflows/release.yml` (manual `workflow_dispatch`; needs the
+    `CRATES_IO_TOKEN` secret).
   - LF line endings via `.gitattributes` (`* text=auto eol=lf`); `.editorconfig`
     covers editor defaults for non-Rust files.
 - It uses **jujutsu (`jj`)** colocated with git. Drive VCS through `jj`.

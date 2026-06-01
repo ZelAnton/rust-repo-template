@@ -86,19 +86,19 @@ committed.
   bucketing by prefix (`feat`→Added, `fix`→Fixed, `remove`→Removed,
   `perf`/`refactor`/`ci`/…→Changed, `docs`/`chore`/`test`→skipped). Clean
   conventional-commit subjects are what make that fallback useful.
-- This template ships an **opt-in** release workflow at
-  `.github/workflows/release.yml.disabled`. It is a **manual** (`workflow_dispatch`)
-  Action with no push/tag trigger, so renaming the file to enable it never
-  auto-releases. You pick a `patch` / `minor` / `major` bump from a menu; the next
-  version is **computed** from `Cargo.toml` (never typed by hand) — the first
-  release (no `v*` tag yet) ships the current version as-is. The workflow then
-  auto-fills an empty `[Unreleased]` via git-cliff, promotes the changelog, commits
-  the bump, tags `v<version>`, publishes a **GitHub Release** with the curated
-  notes, and runs `cargo publish`. It is disabled by default — GitHub ignores the
-  `.disabled` extension. Enable it by renaming to `release.yml` and adding the
-  `CRATES_IO_TOKEN` repository secret. For a multi-crate workspace, replace it
-  with per-crate inputs and `<crate>-v<version>` tags (see the workspace track in
-  the agent guide).
+- This template ships a release workflow at `.github/workflows/release.yml`. It
+  is a **manual** (`workflow_dispatch`) Action with no push/tag trigger, so it
+  never auto-releases — safe to ship enabled. You pick a `patch` / `minor` /
+  `major` bump from a menu; the next version is **computed** from `Cargo.toml`
+  (never typed by hand) — the first release (no `v*` tag yet) ships the current
+  version as-is. The workflow then auto-fills an empty `[Unreleased]` via
+  git-cliff, promotes the changelog, commits the bump, verifies the crate
+  publishes (a `cargo publish --dry-run` gate **before** the irreversible
+  tag/push), tags `v<version>`, publishes a **GitHub Release** with the curated
+  notes, and runs `cargo publish`. It needs the `CRATES_IO_TOKEN` repository
+  secret (a preflight step fails fast if it is missing). For a multi-crate
+  workspace, replace it with per-crate inputs and `<crate>-v<version>` tags (see
+  the workspace track in the agent guide).
 
 ## Supply chain and MSRV
 
