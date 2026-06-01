@@ -51,10 +51,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Fail fast if the publish credential is missing, BEFORE any irreversible
-      # step (tag/push/GitHub Release). Otherwise a missing secret would only
-      # surface at the final `cargo publish`, stranding a tag + Release with no
-      # matching crates.io version.
+      # Fail fast (in seconds) if the publish credential is missing — before the
+      # slow build / version bump / changelog work — and with a clear message
+      # instead of cargo's opaque auth error. (Publishing now precedes the tag,
+      # so a missing token can no longer strand a tag; this is purely about
+      # failing early and legibly.)
       - name: Preflight — require CRATES_IO_TOKEN
         env:
           TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
