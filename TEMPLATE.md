@@ -49,6 +49,42 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    switch to a library crate (`src/lib.rs`) — and fill the `Project` section of
    `AGENTS.md`.
 
+5. **Keep the agent instructions local to your repo.** This template tracks its
+   own `AGENTS.md`, `CLAUDE.md`, and `.claude/` so template contributors share
+   one config. In *your* generated repo they're private working notes, not
+   artifacts to publish — so untrack and ignore them. In `.gitignore`, delete the
+   `!.claude/` and `!.claude/**` lines (they force `.claude/` to be committed),
+   their comment, and the now-redundant `.claude/settings.local.json` line, then
+   add:
+
+   ```gitignore
+   # Agent instructions — local-only to this repo, never committed.
+   /AGENTS.md
+   /CLAUDE.md
+   /.claude/
+   ```
+
+   Add any other agent-instruction files you introduce later (e.g.
+   `.cursorrules`, `.github/copilot-instructions.md`) to that same list.
+
+   Then stop tracking the copies the template shipped — an ignore rule alone
+   won't drop files git already tracks, so remove them from the index too (the
+   files stay on disk):
+
+   ```bash
+   git rm -r --cached AGENTS.md CLAUDE.md .claude/
+   git add .gitignore   # stage the .gitignore edits above, or they won't be committed
+   git commit -m "chore: keep agent instructions local-only"
+   ```
+
+   In a **jj-colocated** repo, run `jj file untrack AGENTS.md CLAUDE.md .claude`
+   instead (no separate commit needed) — add the `.gitignore` lines first, as
+   `jj file untrack` only drops paths that are already ignored.
+
+   Do this **before your first push**. A repo created via GitHub's *Use this
+   template* already has these files in its initial commit, so untracking keeps
+   them out of *later* commits only — anything already pushed stays in history.
+
 ## Placeholder tokens
 
 | Token | Meaning |
@@ -69,6 +105,9 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
 
 ## Post-setup checklist
 
+- [ ] Agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) untracked and
+      git-ignored so they're kept local and not committed going forward — done
+      before the first push (step 5 above).
 - [ ] `LICENSE` author/year and license choice reviewed.
 - [ ] `Cargo.toml` metadata (`description`, `repository`) filled in / correct.
 - [ ] `repository` URL matches the real remote (`git remote get-url origin`).

@@ -87,6 +87,46 @@ Confirm these facts by reading, not by assuming:
 4. Replace the placeholder `main`/test with the real code (or switch to
    `src/lib.rs`), fill the `AGENTS.md` `Project` section, and confirm the
    `repository` URL matches the real remote (`git remote get-url origin`).
+5. **Make the agent instructions local-only.** The template ships its agent
+   instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) *tracked* so template
+   contributors share one config — but a repo *generated* from the template
+   should keep them local: they're your private working notes for this project,
+   not artifacts to publish. So in the new repo, stop tracking them and ignore
+   them (this does **not** apply to the template repo itself, which keeps them
+   tracked):
+   1. In `.gitignore`, delete the `!.claude/` and `!.claude/**` lines (they exist
+      to *force* `.claude/` to be committed — the opposite of what you now want),
+      along with their explanatory comment and the now-redundant
+      `.claude/settings.local.json` line, then add the instruction files:
+
+      ```gitignore
+      # Agent instructions — local-only to this repo, never committed.
+      /AGENTS.md
+      /CLAUDE.md
+      /.claude/
+      ```
+
+      Add any other agent-instruction files you introduce later (e.g.
+      `.cursorrules`, `.github/copilot-instructions.md`) to that same list.
+   2. Stop tracking the copies the template committed — an ignore rule alone
+      won't drop files git already tracks, so remove them from the index too
+      (the files stay on disk):
+
+      ```bash
+      git rm -r --cached AGENTS.md CLAUDE.md .claude/
+      git add .gitignore   # stage the .gitignore edits above, or they won't be committed
+      git commit -m "chore: keep agent instructions local-only"
+      ```
+
+      In a **jj-colocated** repo, use `jj file untrack AGENTS.md CLAUDE.md
+      .claude` instead of the `git` commands (it folds into the working-copy
+      commit). Order matters: `jj file untrack` only drops paths already matched
+      by an ignore rule, so do step 1 first.
+
+   From then on, edits to these files are neither staged nor pushed. **Do this
+   before the first push:** a repo created via GitHub's *Use this template*
+   already carries these files in its initial commit, so untracking keeps them
+   out of *later* commits only — anything already pushed stays in history.
 
 If the user only asks to "initialize from the template" with a crate name and
 nothing structurally unusual, **this is the whole job.** Resist the urge to

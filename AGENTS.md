@@ -12,6 +12,51 @@ and post-setup checklist. Treat updating the failure log as part of "done": if
 you hit a mistake the guide didn't prevent, add it back to the **template's**
 copy so the next project doesn't repeat it.
 
+**Agent instructions are local-only downstream.** This template tracks its own
+`AGENTS.md`, `CLAUDE.md`, and `.claude/` (the `.gitignore` even force-includes
+`.claude/`) so template contributors share one config.
+
+> **Scope:** the steps below are for a repo **generated from this template**, not
+> the template itself. If you are working in the template repo, these files stay
+> tracked and pushed — leave them as they are and do nothing here.
+
+A generated repo should instead keep them local: they're that project's private
+working notes, not published artifacts. In the generated repo, delete the
+`!.claude/` and `!.claude/**` lines from `.gitignore` (plus the now-redundant
+`.claude/settings.local.json` line and their comment), add the instruction
+files, and stop tracking the committed copies — they stay on disk:
+
+```gitignore
+# Agent instructions — local-only to this repo, never committed.
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+```
+
+Add any other agent-instruction files you introduce later (e.g. `.cursorrules`,
+`.github/copilot-instructions.md`) to that same list.
+
+With those ignore lines in place, untrack the committed copies — an ignore rule
+alone won't drop files git already tracks, so you must also remove them from the
+index (the working-copy files stay on disk):
+
+```bash
+git rm -r --cached AGENTS.md CLAUDE.md .claude/   # untrack; files stay on disk
+git add .gitignore                                # stage the .gitignore edits above
+git commit -m "chore: keep agent instructions local-only"
+```
+
+In a **jj-colocated** repo, drop the `git` commands and run `jj file untrack
+AGENTS.md CLAUDE.md .claude` instead (it folds into the working-copy commit, so
+there's no separate commit step). `jj file untrack` only accepts paths that are
+*already* ignored, so add the `.gitignore` lines above first.
+
+Do this **before the first push**: a repo created via GitHub's *Use this
+template* already has these files in its initial commit, so untracking keeps
+them out of *later* commits only — whatever was already pushed remains in
+history. (The init guide repeats this recipe, but the init script deletes that
+guide, so this copy is the one that survives downstream.)
+
 ## Project
 
 > **TODO:** Describe this crate — what it does, the binary/library name, and any
