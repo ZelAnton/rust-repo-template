@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 # Cancel superseded runs on the same ref so a new push doesn't queue behind stale CI.
 concurrency:
@@ -14,12 +15,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  yaml-lint:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are pinned to a full commit SHA (supply-chain hardening); the
+      # trailing comment records the human-readable version. Dependabot bumps the
+      # SHA and updates the comment on its weekly run.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.x'
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      # Config is .yamllint.yml — tuned for Actions YAML. Real defects (tabs,
+      # duplicate keys, bad indentation) fail; cosmetic line-length stays a
+      # non-failing warning.
+      - name: Lint YAML
+        run: yamllint .
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -28,11 +50,11 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -41,11 +63,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo build --all-targets
       - run: cargo test
 
@@ -53,9 +75,9 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Scan the dependency tree for security advisories and banned/duplicate crates.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2
         with:
           command: check advisories bans
 
@@ -63,16 +85,16 @@ jobs:
     name: msrv (1.85)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       # Verify the crate still builds on its declared Minimum Supported Rust
       # Version. Keep `toolchain` in sync with `rust-version` in Cargo.toml.
       # (`@master` + the `toolchain` input accepts a two-component "1.85"; the
       # version-branch refs require a full patch version like `@1.85.0`.)
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@master # rolling toolchain selector — intentionally unpinned
         with:
           toolchain: "1.85"
       # rust-toolchain.toml tracks stable and would otherwise win here; remove it
       # so cargo uses the 1.85 toolchain installed above and truly tests the floor.
       - run: rm -f rust-toolchain.toml
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo check --all-targets
