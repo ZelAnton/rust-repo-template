@@ -328,8 +328,8 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          git config user.name  "Anton Zhelezniakou"
-          git config user.email "github@zelanton.net"
+          git config user.name  "__Author__"
+          git config user.email "__AuthorEmail__"
           # Stage exactly the release artifacts. (release-notes.md lives in
           # $RUNNER_TEMP, outside the tree, so it is never a candidate here.)
           git add Cargo.toml Cargo.lock CHANGELOG.md

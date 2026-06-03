@@ -35,8 +35,8 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 Confirm these facts by reading, not by assuming:
 
 - It is a **token template**, not a ready project. Placeholder tokens
-  (`__CrateName__`, `__Author__`, `__GitHubOwner__`, `__Description__`,
-  `__Year__`) appear in file contents (and may appear in file/folder
+  (`__CrateName__`, `__Author__`, `__AuthorEmail__`, `__GitHubOwner__`,
+  `__Description__`, `__Year__`) appear in file contents (and may appear in file/folder
   names in workspace adaptations). `scripts/init.ps1` (or the POSIX
   `scripts/init.sh`) substitutes them.
 - It is **single-crate** by default: a binary crate (`src/main.rs`) with an

@@ -91,6 +91,7 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 |---|---|
 | `__CrateName__` | crate name + repository name (and any token-named files/folders) |
 | `__Author__` | author (LICENSE copyright holder) |
+| `__AuthorEmail__` | author email (release-commit identity in `release.yml`) |
 | `__GitHubOwner__` | GitHub owner/org in repository URLs |
 | `__Description__` | crate description (`Cargo.toml`) |
 | `__Year__` | copyright year (LICENSE) |

@@ -6,8 +6,8 @@
 .DESCRIPTION
     POSIX counterpart: scripts/init.sh — use whichever matches your shell.
 
-    Replaces the placeholder tokens (__CrateName__, __Author__, __GitHubOwner__,
-    __Description__, __Year__) in file contents AND in file/folder
+    Replaces the placeholder tokens (__CrateName__, __Author__, __AuthorEmail__,
+    __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder
     names, then removes the template-only files (TEMPLATE.md,
     docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
     init.ps1 and init.sh).
@@ -25,6 +25,9 @@
 
 .PARAMETER Author
     Author for LICENSE. Defaults to `git config user.name`, else "Your Name".
+
+.PARAMETER AuthorEmail
+    Author email for the release commit. Defaults to `git config user.email`, else "you@example.com".
 
 .PARAMETER GitHubOwner
     GitHub owner/org used in repository URLs. Defaults to "your-org".
@@ -47,6 +50,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$CrateName,
     [string]$Author,
+    [string]$AuthorEmail,
     [string]$GitHubOwner,
     [string]$Description,
     [int]$Year = (Get-Date).Year,
@@ -64,6 +68,10 @@ if (-not $Author) {
     $Author = (& git config user.name 2>$null)
     if (-not $Author) { $Author = 'Your Name' }
 }
+if (-not $AuthorEmail) {
+    $AuthorEmail = (& git config user.email 2>$null)
+    if (-not $AuthorEmail) { $AuthorEmail = 'you@example.com' }
+}
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: crate description' }
 
@@ -73,6 +81,7 @@ $selfPath = $PSCommandPath
 $replacements = [ordered]@{
     '__CrateName__'   = $CrateName
     '__Author__'      = $Author
+    '__AuthorEmail__' = $AuthorEmail
     '__GitHubOwner__' = $GitHubOwner
     '__Description__'  = $Description
     '__Year__'        = "$Year"

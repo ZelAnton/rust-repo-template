@@ -3,14 +3,15 @@
 # Initializes this template into a concrete Rust project (POSIX counterpart of
 # init.ps1 — use whichever matches your shell; both do the same thing).
 #
-# Replaces the placeholder tokens (__CrateName__, __Author__, __GitHubOwner__,
-# __Description__, __Year__) in file contents AND in file/folder names,
+# Replaces the placeholder tokens (__CrateName__, __Author__, __AuthorEmail__,
+# __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder names,
 # then removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md)
 # and — unless --keep-script — both initializers (init.sh and init.ps1).
 #
 # Usage:
 #   bash ./scripts/init.sh --crate-name my-tool \
-#       [--author "Jane Doe"] [--github-owner acme] [--description "A small tool"] \
+#       [--author "Jane Doe"] [--author-email you@example.com] \
+#       [--github-owner acme] [--description "A small tool"] \
 #       [--year 2026] [--keep-script]
 #
 # --crate-name is required; the rest fall back to sensible defaults so the
@@ -20,6 +21,7 @@ set -euo pipefail
 
 crate_name=""
 author=""
+author_email=""
 github_owner=""
 description=""
 year=""
@@ -31,11 +33,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --crate-name)   crate_name="${2:-}"; shift 2 ;;
     --author)       author="${2:-}"; shift 2 ;;
+    --author-email) author_email="${2:-}"; shift 2 ;;
     --github-owner) github_owner="${2:-}"; shift 2 ;;
     --description)  description="${2:-}"; shift 2 ;;
     --year)         year="${2:-}"; shift 2 ;;
     --keep-script)  keep_script=1; shift ;;
-    -h|--help)      sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,18p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
   esac
 done
@@ -56,6 +59,10 @@ if [ -z "$author" ]; then
   author="$(git config user.name 2>/dev/null || true)"
   [ -n "$author" ] || author="Your Name"
 fi
+if [ -z "$author_email" ]; then
+  author_email="$(git config user.email 2>/dev/null || true)"
+  [ -n "$author_email" ] || author_email="you@example.com"
+fi
 [ -n "$github_owner" ] || github_owner="your-org"
 [ -n "$description" ]  || description="TODO: crate description"
 [ -n "$year" ]         || year="$(date +%Y)"
@@ -70,6 +77,7 @@ sibling_ps1="$script_dir/init.ps1"
 # break the manifest.
 toml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 author_t="$(toml_escape "$author")"
+author_email_t="$(toml_escape "$author_email")"
 owner_t="$(toml_escape "$github_owner")"
 desc_t="$(toml_escape "$description")"
 crate_t="$(toml_escape "$crate_name")"
@@ -86,14 +94,15 @@ while IFS= read -r -d '' file; do
     "$self"|"$sibling_ps1") continue ;;
   esac
   case "$file" in
-    *.toml) c=$crate_t; a=$author_t; o=$owner_t; d=$desc_t; y=$year_t ;;
-    *)      c=$crate_name; a=$author; o=$github_owner; d=$description; y=$year ;;
+    *.toml) c=$crate_t; a=$author_t; ae=$author_email_t; o=$owner_t; d=$desc_t; y=$year_t ;;
+    *)      c=$crate_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
   orig="$content"
   content="${content//__CrateName__/$c}"
   content="${content//__Author__/$a}"
+  content="${content//__AuthorEmail__/$ae}"
   content="${content//__GitHubOwner__/$o}"
   content="${content//__Description__/$d}"
   content="${content//__Year__/$y}"
