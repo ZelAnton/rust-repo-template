@@ -17,13 +17,13 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 2. Run the init script once to stamp your crate name in:
 
    ```pwsh
-   pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
+   pwsh ./scripts/init.ps1 -ProjectName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
    ```
 
    On a POSIX shell (Linux/macOS, or git-bash) run the equivalent instead:
 
    ```bash
-   bash ./scripts/init.sh --crate-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
+   bash ./scripts/init.sh --project-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
    ```
 
    The crate name is required; the rest are optional and fall back to sensible
@@ -32,9 +32,9 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    - replaces the placeholder tokens in every file's contents (TOML values are
      escaped for `Cargo.toml`);
    - renames any token-named files/folders (none in the single-crate skeleton,
-     but it supports `crates/__CrateName__`-style workspace adaptations);
-   - activates `.claude/settings.json` from a `.template` if one is shipped
-     (the default settings is an active, hook-only file — nothing to activate);
+     but it supports `crates/__ProjectName__`-style workspace adaptations);
+   - activates `.claude/settings.json` from the shipped
+     `.claude/settings.json.template`;
    - deletes this `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, and (unless
      `-KeepScript` / `--keep-script`) both initializers (`init.ps1` and `init.sh`).
 3. Verify:
@@ -89,7 +89,7 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 
 | Token | Meaning |
 |---|---|
-| `__CrateName__` | crate name + repository name (and any token-named files/folders) |
+| `__ProjectName__` | project name → crate name (derived crate-safe: lowercased, non-alphanumerics collapsed to `-`) + repository name (and any token-named files/folders) |
 | `__Author__` | author (LICENSE copyright holder) |
 | `__AuthorEmail__` | author email (release-commit identity in `release.yml`) |
 | `__GitHubOwner__` | GitHub owner/org in repository URLs |

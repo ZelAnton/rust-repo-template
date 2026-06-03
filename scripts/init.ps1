@@ -6,7 +6,7 @@
 .DESCRIPTION
     POSIX counterpart: scripts/init.sh — use whichever matches your shell.
 
-    Replaces the placeholder tokens (__CrateName__, __Author__, __AuthorEmail__,
+    Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
     __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder
     names, then removes the template-only files (TEMPLATE.md,
     docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
@@ -14,14 +14,17 @@
 
     Run it once, right after creating a repository from the template:
 
-        pwsh ./scripts/init.ps1 -CrateName my-tool
+        pwsh ./scripts/init.ps1 -ProjectName my-tool
 
     Omitted optional values fall back to sensible defaults so the result always
     builds; edit LICENSE / Cargo.toml afterwards if you need to refine them.
 
-.PARAMETER CrateName
-    Crate name / repository name. Required. crates.io-legal: letters, digits,
-    hyphens, underscores (kebab-case recommended, e.g. my-tool).
+.PARAMETER ProjectName
+    Project name / repository name. Required. Used verbatim for the repository
+    name and any token-named files/folders; the crate name (Cargo.toml) is
+    *derived* from it as a crates.io-legal slug (lowercased, runs of
+    non-alphanumerics collapsed to '-', leading/trailing '-' trimmed) —
+    e.g. "Acme.Widgets" -> "acme-widgets".
 
 .PARAMETER Author
     Author for LICENSE. Defaults to `git config user.name`, else "Your Name".
@@ -43,12 +46,12 @@
     docs/AGENT-INIT-GUIDE.md are removed either way.
 
 .EXAMPLE
-    pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
+    pwsh ./scripts/init.ps1 -ProjectName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$CrateName,
+    [string]$ProjectName,
     [string]$Author,
     [string]$AuthorEmail,
     [string]$GitHubOwner,
@@ -59,9 +62,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# crates.io accepts ASCII alphanumerics plus `-` and `_`; must start with a letter.
-if ($CrateName -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
-    throw "Invalid -CrateName '$CrateName'. Use letters, digits, '-' or '_'; start with a letter (e.g. my-tool)."
+# Derive a crates.io-legal crate name from the project name: lowercase, collapse
+# runs of non-alphanumerics to '-', trim leading/trailing '-'. crates.io accepts
+# ASCII alphanumerics plus '-' and '_'; this slug stays within that set.
+$crateSafe = ($ProjectName.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
+if (-not $crateSafe) {
+    throw "Invalid -ProjectName '$ProjectName'. It must contain at least one ASCII letter or digit so a crate name can be derived (e.g. my-tool)."
 }
 
 if (-not $Author) {
@@ -79,7 +85,7 @@ $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
 $replacements = [ordered]@{
-    '__CrateName__'   = $CrateName
+    '__ProjectName__' = $crateSafe
     '__Author__'      = $Author
     '__AuthorEmail__' = $AuthorEmail
     '__GitHubOwner__' = $GitHubOwner
@@ -106,7 +112,7 @@ function Test-Excluded([string]$fullPath) {
     return $false
 }
 
-Write-Host "==> Initializing template as '$CrateName'" -ForegroundColor Cyan
+Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
 
 # 1) Replace tokens in file contents. Both initializers are skipped: they carry
 #    the literal token strings as search keys, so substituting inside them would
@@ -134,19 +140,18 @@ Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor D
 # 2) Rename files and folders whose name contains the crate-name token.
 #    Deepest paths first so child renames don't invalidate parent paths.
 #    (The single-crate skeleton has none, but workspace adaptations may add
-#    `crates/__CrateName__` etc., so support it.)
+#    `crates/__ProjectName__` etc., so support it.)
 $named = Get-ChildItem -Path $repoRoot -Recurse | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__CrateName__*'
+    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
 } | Sort-Object { $_.FullName.Length } -Descending
 foreach ($item in $named) {
-    $newName = $item.Name.Replace('__CrateName__', $CrateName)
+    $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
     Rename-Item -LiteralPath $item.FullName -NewName $newName
     Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
 }
 
-# 3) Activate Claude Code shared settings if shipped as a .template. The Rust
-#    template currently ships an active, hook-only settings.json (no permission
-#    grants), so this is a no-op unless a future .template is added.
+# 3) Activate Claude Code shared settings from the shipped .template (renames
+#    .claude/settings.json.template -> .claude/settings.json).
 $claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
 if (Test-Path $claudeTemplate) {
     Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force

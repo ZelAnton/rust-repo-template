@@ -3,23 +3,24 @@
 # Initializes this template into a concrete Rust project (POSIX counterpart of
 # init.ps1 — use whichever matches your shell; both do the same thing).
 #
-# Replaces the placeholder tokens (__CrateName__, __Author__, __AuthorEmail__,
+# Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
 # __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder names,
 # then removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md)
 # and — unless --keep-script — both initializers (init.sh and init.ps1).
 #
 # Usage:
-#   bash ./scripts/init.sh --crate-name my-tool \
+#   bash ./scripts/init.sh --project-name my-tool \
 #       [--author "Jane Doe"] [--author-email you@example.com] \
 #       [--github-owner acme] [--description "A small tool"] \
 #       [--year 2026] [--keep-script]
 #
-# --crate-name is required; the rest fall back to sensible defaults so the
-# result always builds. Edit LICENSE / Cargo.toml afterwards to refine them.
+# --project-name is required; the rest fall back to sensible defaults so the
+# result always builds. The crate name (Cargo.toml) is derived from the project
+# name as a crates.io-legal slug. Edit LICENSE / Cargo.toml afterwards to refine.
 
 set -euo pipefail
 
-crate_name=""
+project_name=""
 author=""
 author_email=""
 github_owner=""
@@ -31,7 +32,7 @@ die() { echo "error: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --crate-name)   crate_name="${2:-}"; shift 2 ;;
+    --project-name) project_name="${2:-}"; shift 2 ;;
     --author)       author="${2:-}"; shift 2 ;;
     --author-email) author_email="${2:-}"; shift 2 ;;
     --github-owner) github_owner="${2:-}"; shift 2 ;;
@@ -43,16 +44,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$crate_name" ] || die "--crate-name is required (e.g. --crate-name my-tool)."
+[ -n "$project_name" ] || die "--project-name is required (e.g. --project-name my-tool)."
 
-# crates.io accepts ASCII alphanumerics plus '-' and '_'; must start with a letter.
-case "$crate_name" in
-  [A-Za-z]*) : ;;
-  *) die "invalid --crate-name '$crate_name'. Start with a letter." ;;
-esac
-case "$crate_name" in
-  *[!A-Za-z0-9_-]*) die "invalid --crate-name '$crate_name'. Use letters, digits, '-' or '_'." ;;
-esac
+# Derive a crates.io-legal crate name from the project name: lowercase, collapse
+# runs of non-alphanumerics to '-', trim leading/trailing '-'. The result stays
+# within the crates.io-accepted set (ASCII alphanumerics plus '-' and '_').
+crate_name="$(printf '%s' "$project_name" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//')"
+[ -n "$crate_name" ] || die "invalid --project-name '$project_name'. It must contain at least one ASCII letter or digit so a crate name can be derived (e.g. my-tool)."
 
 # Defaults (mirror init.ps1).
 if [ -z "$author" ]; then
@@ -100,7 +98,7 @@ while IFS= read -r -d '' file; do
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
   orig="$content"
-  content="${content//__CrateName__/$c}"
+  content="${content//__ProjectName__/$c}"
   content="${content//__Author__/$a}"
   content="${content//__AuthorEmail__/$ae}"
   content="${content//__GitHubOwner__/$o}"
@@ -115,22 +113,22 @@ echo "    Updated contents in $changed file(s)."
 
 # 2) Rename files and folders whose name contains the crate-name token. -depth
 #    processes children before parents so a renamed dir doesn't invalidate paths.
-#    (None in the single-crate skeleton; supports `crates/__CrateName__` etc.)
+#    (None in the single-crate skeleton; supports `crates/__ProjectName__` etc.)
 while IFS= read -r -d '' item; do
   case "$item" in
     */.git/*|*/.jj/*|*/target/*) continue ;;
   esac
   dir="$(dirname "$item")"
   base="$(basename "$item")"
-  newbase="${base//__CrateName__/$crate_name}"
+  newbase="${base//__ProjectName__/$crate_name}"
   if [ "$newbase" != "$base" ]; then
     mv "$item" "$dir/$newbase"
     echo "    Renamed $base -> $newbase"
   fi
-done < <(find "$repo_root" -depth -name '*__CrateName__*' -print0)
+done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
 
-# 3) Activate Claude Code shared settings if shipped as a .template (no-op for
-#    the current active, hook-only settings.json).
+# 3) Activate Claude Code shared settings from the shipped .template (renames
+#    .claude/settings.json.template -> .claude/settings.json).
 if [ -f "$repo_root/.claude/settings.json.template" ]; then
   mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
   echo "    Activated .claude/settings.json"

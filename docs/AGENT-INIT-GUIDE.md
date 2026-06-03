@@ -35,7 +35,7 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 Confirm these facts by reading, not by assuming:
 
 - It is a **token template**, not a ready project. Placeholder tokens
-  (`__CrateName__`, `__Author__`, `__AuthorEmail__`, `__GitHubOwner__`,
+  (`__ProjectName__`, `__Author__`, `__AuthorEmail__`, `__GitHubOwner__`,
   `__Description__`, `__Year__`) appear in file contents (and may appear in file/folder
   names in workspace adaptations). `scripts/init.ps1` (or the POSIX
   `scripts/init.sh`) substitutes them.
@@ -63,13 +63,13 @@ Confirm these facts by reading, not by assuming:
 2. **Run the init script** with the values the user gave you:
 
    ```pwsh
-   pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
+   pwsh ./scripts/init.ps1 -ProjectName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
    ```
 
    On a POSIX shell, run `scripts/init.sh` instead (same behavior, flag syntax):
 
    ```bash
-   bash ./scripts/init.sh --crate-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
+   bash ./scripts/init.sh --project-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
    ```
 
    The crate name is required; the rest fall back to sensible defaults. The
@@ -199,7 +199,7 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
 
 ### 2026-05-31 — second initializer corrupted by the first
 - **Symptom:** When a POSIX `scripts/init.sh` was added next to `init.ps1`, running
-  either initializer rewrote the *other's* literal token strings (`__CrateName__`
+  either initializer rewrote the *other's* literal token strings (`__ProjectName__`
   etc. are the search keys both scripts contain), leaving a broken sibling script
   behind in the downstream repo.
 - **Root cause:** The content-substitution pass excluded only the running script,
@@ -230,7 +230,7 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
 - **Symptom:** The `repository` URL and `CHANGELOG` date/compare links carried
   literal placeholders that were almost shipped.
 - **Root cause:** Hand-editing placeholders is error-prone.
-- **Rule:** These are now tokens (`__GitHubOwner__`, `__CrateName__`) that
+- **Rule:** These are now tokens (`__GitHubOwner__`, `__ProjectName__`) that
   `scripts/init.ps1` substitutes; the URL default comes from `git remote`. The
   `CHANGELOG.md` release date and compare links are filled by the release
   workflow on release, not by init.

@@ -176,8 +176,6 @@ git. Use `jj` commands; the canonical workflow:
 
 	Reliable signals: word changes like "теперь" / "now" / "next" / "также сделай" / "and also" usually mean **new work** or **scope shift**. Imperative follow-ups inside the same scope ("исправь это", "fix this", "продолжи") mean **continuation**. When in doubt, ask the user.
 
-	A `UserPromptSubmit` hook (`.claude/hooks/jj-prompt-reminder.sh`) injects this same checklist into context each turn — the hook is the reminder, this table is the rulebook.
-
 - **Describe early.** When starting a new piece of work, immediately set the change description:
 	```
 	jj describe -m "Concise summary"

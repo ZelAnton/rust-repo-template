@@ -20,4 +20,4 @@ to a dated version section.
 ### Fixed
 -
 
-[Unreleased]: https://github.com/__GitHubOwner__/__CrateName__/commits/HEAD
+[Unreleased]: https://github.com/__GitHubOwner__/__ProjectName__/commits/HEAD

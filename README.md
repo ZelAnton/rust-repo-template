@@ -18,8 +18,8 @@ metadata in.
 - **`AGENTS.md`** + **`CLAUDE.md`** — guidance for AI coding agents: build/test
   commands, code-style and dependency conventions, the changelog process, and
   the jujutsu (`jj`) version-control workflow.
-- **`.claude/`** — a `UserPromptSubmit` hook that injects the `jj` change-scope
-  checklist into the agent's context each turn.
+- **`.claude/`** — shared Claude Code settings (`settings.json.template`, activated
+  by `scripts/init.ps1`/`init.sh`) granting sane permissions for `cargo` commands.
 - **`.gitattributes`** — LF line-ending normalization (keeps git and colocated
   `jj` agreeing on the working copy, especially on Windows).
 - **`.editorconfig`** — editor defaults (LF, final newline, trim trailing) for
@@ -54,14 +54,14 @@ metadata in.
 Run the init script, then verify:
 
 ```pwsh
-pwsh ./scripts/init.ps1 -CrateName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
+pwsh ./scripts/init.ps1 -ProjectName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
 cargo build && cargo test
 ```
 
 On a POSIX shell (Linux/macOS, or git-bash) use the equivalent:
 
 ```bash
-bash ./scripts/init.sh --crate-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
+bash ./scripts/init.sh --project-name my-tool --author "Jane Doe" --github-owner acme --description "A small tool"
 cargo build && cargo test
 ```
 
