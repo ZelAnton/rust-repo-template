@@ -43,7 +43,7 @@ Confirm these facts by reading, not by assuming:
   integration test (`tests/integration.rs`), edition 2024.
 - Conventions (all enforced — see `AGENTS.md`):
   - CI is strict: `cargo fmt --all --check`, `cargo clippy --all-targets
-    -- -D warnings` (warnings are errors), build + test on Linux **and** Windows,
+    -- -D warnings` (warnings are errors), build + test on Linux, Windows **and** macOS,
     a `cargo-deny` supply-chain scan (`deny.toml`), and an MSRV check.
   - Every dependency gets a "why" comment in `Cargo.toml`; `Cargo.lock` is
     committed; no fixed allow-list of crates.
@@ -85,7 +85,8 @@ Confirm these facts by reading, not by assuming:
    cargo fmt --all --check
    ```
 4. Replace the placeholder `main`/test with the real code (or switch to
-   `src/lib.rs`), fill the `AGENTS.md` `Project` section, and confirm the
+   `src/lib.rs`), fill the `AGENTS.md` `Project` section, replace `README.md`
+   (the shipped one documents *the template*, not the new crate), and confirm the
    `repository` URL matches the real remote (`git remote get-url origin`).
 5. **Make the agent instructions local-only.** The template ships its agent
    instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) *tracked* so template

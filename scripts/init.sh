@@ -15,9 +15,13 @@
 #       [--year 2026] [--keep-script]
 #
 # --project-name is required; the rest fall back to sensible defaults so the
-# result always builds. The crate name (Cargo.toml) is derived from the project
-# name as a crates.io-legal slug that must start with a letter (cargo rejects a
-# leading digit; init errors if it does not). Edit LICENSE / Cargo.toml to refine.
+# result always builds. A crates.io-legal slug is derived from the project name
+# (lowercased, non-alphanumerics -> '-', e.g. "Acme.Widgets" -> "acme-widgets")
+# and that slug is substituted for every __ProjectName__ token: the crate name,
+# the `repository` URL, and any token-named files/folders (never the original
+# casing). The slug must start with a letter (cargo rejects a leading digit; init
+# errors if it does not). Name your GitHub repo with the slug, or edit Cargo.toml
+# / LICENSE to refine.
 
 set -euo pipefail
 
@@ -40,7 +44,7 @@ while [ $# -gt 0 ]; do
     --description)  description="${2:-}"; shift 2 ;;
     --year)         year="${2:-}"; shift 2 ;;
     --keep-script)  keep_script=1; shift ;;
-    -h|--help)      sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,24p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
   esac
 done

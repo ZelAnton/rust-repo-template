@@ -89,7 +89,7 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 
 | Token | Meaning |
 |---|---|
-| `__ProjectName__` | project name → crate name (derived crate-safe: lowercased, non-alphanumerics collapsed to `-`) + repository name (and any token-named files/folders) |
+| `__ProjectName__` | a crates.io-legal slug **derived** from your project name (lowercased, non-alphanumerics collapsed to `-`; e.g. `Acme.Widgets` → `acme-widgets`). The same slug is substituted everywhere `__ProjectName__` appears — crate name, the `repository` URL, and any token-named files/folders — never the original casing. Name your GitHub repo with this slug, or fix `repository` to match your real remote (see the post-setup checklist). |
 | `__Author__` | author (LICENSE copyright holder) |
 | `__AuthorEmail__` | author email (release-commit identity in `release.yml`) |
 | `__GitHubOwner__` | GitHub owner/org in repository URLs |
@@ -109,6 +109,9 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
 - [ ] Agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) untracked and
       git-ignored so they're kept local and not committed going forward — done
       before the first push (step 5 above).
+- [ ] `README.md` replaced with your project's README — the shipped one
+      describes *this template*, not your crate (and init rewrote its token
+      examples while substituting).
 - [ ] `LICENSE` author/year and license choice reviewed.
 - [ ] `Cargo.toml` metadata (`description`, `repository`) filled in / correct.
 - [ ] `repository` URL matches the real remote (`git remote get-url origin`).

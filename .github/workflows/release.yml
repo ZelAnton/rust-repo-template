@@ -303,7 +303,7 @@ jobs:
               "### Fixed\n-\n\n"
               f"## [{version}] - {date}"
           )
-          text, n = re.subn(r"^## \[Unreleased\]$", new_unreleased, text, count=1, flags=re.M)
+          text, n = re.subn(r"^## \[Unreleased\][ \t]*$", new_unreleased, text, count=1, flags=re.M)
           if n != 1:
               print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
               sys.exit(1)

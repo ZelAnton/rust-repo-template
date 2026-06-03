@@ -35,6 +35,8 @@ metadata in.
   single-crate crates.io publish workflow (pick a bump → promote changelog →
   dry-run gate → publish → tag → GitHub Release). Set the `CRATES_IO_TOKEN`
   secret before running it.
+- **`release-token-bypass.md`** — recipe for letting the release workflow push to
+  a PR-protected `main` via a short-lived GitHub App token (kept on init).
 - **`deny.toml`** — cargo-deny config (security advisories + banned/duplicate
   crates) gated by the `cargo-deny` CI job.
 - **`rust-toolchain.toml`** — pins the toolchain to `stable` with rustfmt/clippy;

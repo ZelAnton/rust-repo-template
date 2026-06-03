@@ -20,12 +20,15 @@
     builds; edit LICENSE / Cargo.toml afterwards if you need to refine them.
 
 .PARAMETER ProjectName
-    Project name / repository name. Required. Used verbatim for the repository
-    name and any token-named files/folders; the crate name (Cargo.toml) is
-    *derived* from it as a crates.io-legal slug (lowercased, runs of
-    non-alphanumerics collapsed to '-', leading/trailing '-' trimmed) —
-    e.g. "Acme.Widgets" -> "acme-widgets". The derived name must start with a
-    letter (cargo rejects a leading digit); init errors if it does not.
+    Project name. Required. A crates.io-legal crate name is *derived* from it
+    (lowercased, runs of non-alphanumerics collapsed to '-', leading/trailing
+    '-' trimmed) — e.g. "Acme.Widgets" -> "acme-widgets". That derived slug is
+    what gets substituted for EVERY __ProjectName__ token: the crate name, the
+    `repository` URL in Cargo.toml, and any token-named files/folders (the
+    original casing is never used verbatim). The derived name must start with a
+    letter (cargo rejects a leading digit); init errors if it does not. Name your
+    GitHub repo with the same slug, or edit Cargo.toml's `repository` to match
+    your real remote.
 
 .PARAMETER Author
     Author for LICENSE. Defaults to `git config user.name`, else "Your Name".
