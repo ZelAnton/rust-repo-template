@@ -197,6 +197,21 @@ wrong or obsolete.
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
 
+### 2026-06-04 — init.sh emitted an unbuildable Cargo.toml on a backslash
+- **Symptom:** `scripts/init.sh --description 'runs on C:\Windows'` wrote
+  `description = "runs on C:\Windows"` to `Cargo.toml`; `cargo build` then failed
+  with `error: missing escaped value`. `\t`/`\n` in a value silently corrupted to
+  a tab/newline instead. `init.ps1` was unaffected.
+- **Root cause:** `toml_escape` correctly doubled `\`→`\\`, but the substitution
+  used bash `${content//token/$value}`, whose replacement string drops a level of
+  backslash (`\\`→`\` on bash ≥4.3; bash 3.2 leaves it — also version-dependent),
+  re-corrupting the escaping. PowerShell's `.Replace()` is literal, so the two
+  initializers diverged.
+- **Rule:** init.sh substitutes via `awk` (literal `index`/`substr`, source +
+  values passed through `ENVIRON`, which does no escape processing) instead of
+  bash `${//}`. Keep the two initializers byte-for-byte equivalent — a `\` or `"`
+  in `--author`/`--description` must round-trip identically through both.
+
 ### 2026-05-31 — second initializer corrupted by the first
 - **Symptom:** When a POSIX `scripts/init.sh` was added next to `init.ps1`, running
   either initializer rewrote the *other's* literal token strings (`__ProjectName__`

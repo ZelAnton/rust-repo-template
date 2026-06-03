@@ -91,6 +91,35 @@ year_t="$(toml_escape "$year")"
 
 echo "==> Initializing template as '$crate_name'"
 
+# Literal, backslash-safe token replacement. The source text and the six values
+# are passed through the environment because awk's ENVIRON does NO escape
+# processing — unlike bash's `${var//pat/repl}`, which collapses the doubled
+# backslashes toml_escape adds (`\\`->`\` on bash >= 4.3; bash 3.2 leaves them,
+# so it is also version-dependent) and would emit a Cargo.toml that fails to
+# parse on any backslash. The whole file is handled in BEGIN via ENVIRON so no
+# record splitting can add or drop a trailing newline.
+substitute_tokens() {
+  awk '
+    function repl(s, tok, val,   out, i) {
+      out = ""
+      while ((i = index(s, tok)) > 0) {
+        out = out substr(s, 1, i - 1) val
+        s = substr(s, i + length(tok))
+      }
+      return out s
+    }
+    BEGIN {
+      s = ENVIRON["TPL_SRC"]
+      s = repl(s, "__ProjectName__", ENVIRON["TPL_PROJECT"])
+      s = repl(s, "__Author__",      ENVIRON["TPL_AUTHOR"])
+      s = repl(s, "__AuthorEmail__", ENVIRON["TPL_AUTHOR_EMAIL"])
+      s = repl(s, "__GitHubOwner__", ENVIRON["TPL_OWNER"])
+      s = repl(s, "__Description__", ENVIRON["TPL_DESC"])
+      s = repl(s, "__Year__",        ENVIRON["TPL_YEAR"])
+      printf "%s", s
+    }'
+}
+
 # 1) Replace tokens in file contents. Both initializers are skipped: they carry
 #    the literal token strings as search keys, so substituting inside them would
 #    corrupt the sibling script.
@@ -105,15 +134,11 @@ while IFS= read -r -d '' file; do
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
-  orig="$content"
-  content="${content//__ProjectName__/$c}"
-  content="${content//__Author__/$a}"
-  content="${content//__AuthorEmail__/$ae}"
-  content="${content//__GitHubOwner__/$o}"
-  content="${content//__Description__/$d}"
-  content="${content//__Year__/$y}"
-  if [ "$content" != "$orig" ]; then
-    printf '%s' "$content" > "$file"
+  new="$(TPL_SRC="$content" TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
+         TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" substitute_tokens; printf x)"
+  new="${new%x}"
+  if [ "$new" != "$content" ]; then
+    printf '%s' "$new" > "$file"
     changed=$((changed + 1))
   fi
 done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name target \) -prune -o -type f -print0)
