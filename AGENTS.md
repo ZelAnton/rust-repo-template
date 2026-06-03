@@ -189,7 +189,7 @@ git. Use `jj` commands; the canonical workflow:
 	3. Put the work on a **feature bookmark**, not `main`: `jj bookmark create <topic> -r @` the first time (then `jj bookmark move <topic> --to @` as it grows), and push only it: `jj git push --allow-new -b <topic>`.
 	4. Open a pull request into `main` (`gh pr create --base main --head <topic> --fill`, or via the GitHub UI). `main` advances only when that PR merges; afterwards `jj git fetch` brings the merge down and you `jj bookmark delete <topic>`.
 
-	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except any automated actor you grant a branch-protection bypass (e.g. the release workflow's `Tag and push` to `main`).
+	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
 - **Undoing dropped work.** When the user decides to abandon something already done, reach for `jj`'s safety net rather than hand-cleanup:
 	- `jj undo` (alias of `jj op undo`) reverses the last operation — describe, edit, squash, rebase, abandon, push, all of it. Repeatable.
 	- `jj abandon <rev>` drops a specific change entirely; descendants auto-rebase.

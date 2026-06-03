@@ -119,9 +119,10 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
 - [ ] Branch protection for `main` configured — require pull requests (plus CI
       status checks). The agent docs (`AGENTS.md` / `CLAUDE.md`) already assume a
       feature-branch + PR flow into `main`. Requiring PRs blocks the release
-      workflow's direct push of the release commit to `main` — give the release
-      actor a branch-protection bypass (the workflow pushes with the default
-      `GITHUB_TOKEN`; the Actions bot needs a bypass entry).
+      workflow's direct push of the release commit to `main`. The workflow pushes as
+      a GitHub App when configured — add repo variable `RELEASE_APP_ID` + secret
+      `RELEASE_APP_PRIVATE_KEY`, install the App, and add it to the ruleset's bypass
+      list (recipe: `release-token-bypass.md`).
 - [ ] If you publish to crates.io: add the `CRATES_IO_TOKEN` repository secret
       (the release workflow `.github/workflows/release.yml` is already enabled;
       it is manual-only and won't run until you dispatch it).
