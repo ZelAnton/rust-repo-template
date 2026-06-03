@@ -24,7 +24,8 @@
     name and any token-named files/folders; the crate name (Cargo.toml) is
     *derived* from it as a crates.io-legal slug (lowercased, runs of
     non-alphanumerics collapsed to '-', leading/trailing '-' trimmed) —
-    e.g. "Acme.Widgets" -> "acme-widgets".
+    e.g. "Acme.Widgets" -> "acme-widgets". The derived name must start with a
+    letter (cargo rejects a leading digit); init errors if it does not.
 
 .PARAMETER Author
     Author for LICENSE. Defaults to `git config user.name`, else "Your Name".
@@ -68,6 +69,12 @@ $ErrorActionPreference = 'Stop'
 $crateSafe = ($ProjectName.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
 if (-not $crateSafe) {
     throw "Invalid -ProjectName '$ProjectName'. It must contain at least one ASCII letter or digit so a crate name can be derived (e.g. my-tool)."
+}
+# cargo rejects a crate name that starts with a digit ("the name cannot start
+# with a digit"). The slug derivation above can't fix that, so fail clearly here
+# rather than emitting a Cargo.toml that won't build.
+if ($crateSafe -notmatch '^[a-z]') {
+    throw "Invalid -ProjectName '$ProjectName' -> derived crate name '$crateSafe' starts with a non-letter; cargo requires a crate name that starts with a letter. Pick a project name whose first alphanumeric is a letter (e.g. my-tool)."
 }
 
 if (-not $Author) {

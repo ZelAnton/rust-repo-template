@@ -16,7 +16,8 @@
 #
 # --project-name is required; the rest fall back to sensible defaults so the
 # result always builds. The crate name (Cargo.toml) is derived from the project
-# name as a crates.io-legal slug. Edit LICENSE / Cargo.toml afterwards to refine.
+# name as a crates.io-legal slug that must start with a letter (cargo rejects a
+# leading digit; init errors if it does not). Edit LICENSE / Cargo.toml to refine.
 
 set -euo pipefail
 
@@ -51,6 +52,13 @@ done
 # within the crates.io-accepted set (ASCII alphanumerics plus '-' and '_').
 crate_name="$(printf '%s' "$project_name" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//')"
 [ -n "$crate_name" ] || die "invalid --project-name '$project_name'. It must contain at least one ASCII letter or digit so a crate name can be derived (e.g. my-tool)."
+# cargo rejects a crate name that starts with a digit ("the name cannot start
+# with a digit"). The slug derivation above can't fix that, so fail clearly here
+# rather than emitting a Cargo.toml that won't build.
+case "$crate_name" in
+  [a-z]*) : ;;
+  *) die "invalid --project-name '$project_name' -> derived crate name '$crate_name' starts with a non-letter; cargo requires a crate name that starts with a letter. Pick a project name whose first alphanumeric is a letter (e.g. my-tool)." ;;
+esac
 
 # Defaults (mirror init.ps1).
 if [ -z "$author" ]; then

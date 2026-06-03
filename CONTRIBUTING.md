@@ -58,6 +58,6 @@ crate, not the implementer. Pure internal refactors are exempt.
 ## Pull requests
 
 - Keep changes focused; unrelated cleanups belong in their own PR.
-- Ensure CI (fmt, clippy, build/test on Linux and Windows, cargo-deny, MSRV)
-  passes.
+- Ensure CI (fmt, clippy, build/test on Linux, Windows, and macOS, cargo-deny,
+  MSRV) passes.
 - Fill in the pull-request checklist.

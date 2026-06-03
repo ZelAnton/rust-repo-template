@@ -25,11 +25,11 @@ metadata in.
 - **`.editorconfig`** — editor defaults (LF, final newline, trim trailing) for
   the non-Rust files rustfmt doesn't touch (`.toml`, `.yml`, `.md`, `.sh`).
 - **`.gitignore`** — `/target`, per-user scratch files, and the `.claude/`
-  carve-out (ships hook config, excludes the per-user `settings.local.json`).
+  carve-out (ships shared settings, excludes the per-user `settings.local.json`).
 - **`cliff.toml`** + **`CHANGELOG.md`** — Keep a Changelog + git-cliff auto-fill
   from conventional commits.
 - **`.github/workflows/ci.yml`** — `fmt --check`, clippy (`-D warnings`), build +
-  test on Linux/Windows, a `cargo-deny` supply-chain scan, and an MSRV check —
+  test on Linux/Windows/macOS, a `cargo-deny` supply-chain scan, and an MSRV check —
   with `Swatinem/rust-cache` and concurrency-cancel so reruns are fast.
 - **`.github/workflows/release.yml`** — a manual (`workflow_dispatch`)
   single-crate crates.io publish workflow (pick a bump → promote changelog →
