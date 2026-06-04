@@ -11,22 +11,26 @@ have gone wrong in avoidable ways. **Read it before touching any files.**
 > incomplete. The whole point is that the *next* agent doesn't repeat what the
 > last one got wrong. See [Updating this guide](#updating-this-guide).
 
-## TL;DR — the five rules
+## TL;DR — the six rules
 
 1. **Read before you write.** Read `TEMPLATE.md`, this file, `AGENTS.md`, and
    `CLAUDE.md` *first*. Do not generate a single file based on an assumed layout.
-2. **Prefer the init script over hand-rolling.** `scripts/init.ps1` (PowerShell)
+2. **Check the toolchain first.** Run `scripts/check-env.ps1` (or
+   `scripts/check-env.sh`). If it reports a missing tool, STOP and offer the user
+   the install commands it prints — don't run init against an environment that
+   can't build or test.
+3. **Prefer the init script over hand-rolling.** `scripts/init.ps1` (PowerShell)
    and `scripts/init.sh` (POSIX) are the supported path for a standard
    single-crate init — run whichever fits your shell. Don't recreate their token
    substitution by hand.
-3. **Match the shell to the tool.** On Windows the Bash tool is POSIX (git bash);
+4. **Match the shell to the tool.** On Windows the Bash tool is POSIX (git bash);
    PowerShell cmdlets fail there with `command not found`. Use the PowerShell
    tool for `pwsh`/cmdlets, the Bash tool only for POSIX. Prefer the dedicated
    Read / Glob / Grep tools over either shell for file inspection.
-4. **Make the mistake impossible, not just documented.** When you find a gap,
+5. **Make the mistake impossible, not just documented.** When you find a gap,
    prefer fixing the template/script over adding a checklist note (shipping a
    tokenized `LICENSE` beats "remember to add a license").
-5. **Verify, then it's done.** `cargo build` + `cargo test` + `cargo clippy
+6. **Verify, then it's done.** `cargo build` + `cargo test` + `cargo clippy
    --all-targets -- -D warnings` + `cargo fmt --all --check`. If it publishes,
    also `cargo package`.
 
@@ -60,7 +64,10 @@ Confirm these facts by reading, not by assuming:
 ## The happy path (standard single-crate init)
 
 1. **Read** `TEMPLATE.md` and this guide. Skim `AGENTS.md` / `CLAUDE.md`.
-2. **Run the init script** with the values the user gave you:
+2. **Check the environment.** Run `scripts/check-env.ps1` (or `check-env.sh`). If
+   it flags a missing tool, stop and offer the user the install commands it prints
+   before continuing — don't init against an environment that can't build or test.
+3. **Run the init script** with the values the user gave you:
 
    ```pwsh
    pwsh ./scripts/init.ps1 -ProjectName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
@@ -77,18 +84,18 @@ Confirm these facts by reading, not by assuming:
    token-named files/folders, and deletes `TEMPLATE.md`,
    `docs/AGENT-INIT-GUIDE.md`, and both initializers (unless `-KeepScript` /
    `--keep-script`). Run **one** initializer, not both.
-3. **Verify**:
+4. **Verify**:
 
    ```pwsh
    cargo build && cargo test
    cargo clippy --all-targets -- -D warnings
    cargo fmt --all --check
    ```
-4. Replace the placeholder `main`/test with the real code (or switch to
+5. Replace the placeholder `main`/test with the real code (or switch to
    `src/lib.rs`), fill the `AGENTS.md` `Project` section, replace `README.md`
    (the shipped one documents *the template*, not the new crate), and confirm the
    `repository` URL matches the real remote (`git remote get-url origin`).
-5. **Make the agent instructions local-only.** The template ships its agent
+6. **Make the agent instructions local-only.** The template ships its agent
    instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) *tracked* so template
    contributors share one config — but a repo *generated* from the template
    should keep them local: they're your private working notes for this project,

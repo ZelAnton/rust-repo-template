@@ -14,7 +14,24 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
 
 1. Create a new repository from this one (GitHub: **Use this template**), or copy
    the files into a fresh repo.
-2. Run the init script once to stamp your crate name in:
+2. **Check your environment is ready.** Before initializing, confirm this machine
+   has the Rust toolchain to build and test the crate:
+
+   ```pwsh
+   pwsh ./scripts/check-env.ps1
+   ```
+
+   On a POSIX shell (Linux/macOS, or git-bash) run the equivalent instead:
+
+   ```bash
+   bash ./scripts/check-env.sh
+   ```
+
+   It checks for `cargo` and `rustc` (rustup installs the pinned `stable` +
+   rustfmt/clippy from `rust-toolchain.toml` on first build). If the toolchain is
+   missing it lists the install commands for your OS and exits non-zero — install
+   it, then re-run. **Don't run init until it reports the environment is ready.**
+3. Run the init script once to stamp your crate name in:
 
    ```pwsh
    pwsh ./scripts/init.ps1 -ProjectName my-tool -Author "Jane Doe" -GitHubOwner acme -Description "A small tool"
@@ -37,7 +54,7 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
      `.claude/settings.json.template`;
    - deletes this `TEMPLATE.md` and `docs/AGENT-INIT-GUIDE.md`, and (unless
      `-KeepScript` / `--keep-script`) both initializers (`init.ps1` and `init.sh`).
-3. Verify:
+4. Verify:
 
    ```pwsh
    cargo build && cargo test
@@ -45,11 +62,11 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    cargo fmt --all --check
    ```
 
-4. Replace `src/main.rs` (and `tests/integration.rs`) with your real code — or
+5. Replace `src/main.rs` (and `tests/integration.rs`) with your real code — or
    switch to a library crate (`src/lib.rs`) — and fill the `Project` section of
    `AGENTS.md`.
 
-5. **Keep the agent instructions local to your repo.** This template tracks its
+6. **Keep the agent instructions local to your repo.** This template tracks its
    own `AGENTS.md`, `CLAUDE.md`, and `.claude/` so template contributors share
    one config. In *your* generated repo they're private working notes, not
    artifacts to publish — so untrack and ignore them. In `.gitignore`, delete the
@@ -108,7 +125,7 @@ checklist (`[workspace.package]`, independent vs shared versioning, per-crate
 
 - [ ] Agent instructions (`AGENTS.md`, `CLAUDE.md`, `.claude/`) untracked and
       git-ignored so they're kept local and not committed going forward — done
-      before the first push (step 5 above).
+      before the first push (step 6 above).
 - [ ] `README.md` replaced with your project's README — the shipped one
       describes *this template*, not your crate (and init rewrote its token
       examples while substituting).
