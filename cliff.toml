@@ -4,13 +4,15 @@
 #
 # Commits since the previous tag are categorised by the first word of the
 # message into Keep a Changelog buckets:
-#   feat..., add...                                                      -> Added
-#   fix..., bug...                                                       -> Fixed
-#   remove..., delete..., drop...                                        -> Removed
-#   refactor..., change..., update..., rename..., perf..., ux..., ci...  -> Changed
-#   doc..., chore..., test..., style...                                  -> skipped
-#   Release v..., Merge ...                                              -> skipped
-#   anything else                                                        -> Changed (fallback)
+#   feat..., add...                                              -> Added
+#   fix..., bug...                                               -> Fixed
+#   remove..., delete..., drop...                                -> Removed
+#   refactor..., change..., update..., rename..., improv...,     -> Changed
+#     enhance..., perf..., perf-test..., ux..., ci...,
+#     cleanup..., build..., deps...
+#   doc..., docs..., chore..., test..., tests..., style...       -> skipped
+#   Release [v]..., Merge ...                                    -> skipped
+#   anything else                                                -> Changed (fallback)
 #
 # Write conventional-commit subjects with optional scopes, e.g.
 # `feat(parser): ...`, `fix(cli): ...`, `perf(io): ...`, `ux(ui): ...`.

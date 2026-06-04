@@ -387,7 +387,7 @@ jobs:
       # commit + tag atomically (if either ref is rejected, neither lands). A
       # non-atomic push that advanced the branch but dropped the tag would make
       # the next run bump from the already-bumped version and skip a release
-      # number. checkout@v5 leaves a detached HEAD, so the branch is named
+      # number. actions/checkout leaves a detached HEAD, so the branch is named
       # explicitly (`git push origin HEAD` can't resolve a branch when detached).
       # We always release from main (enforced by the "Require main" step above).
       - name: Tag and push
