@@ -54,7 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -67,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
-      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo build --all-targets
       - run: cargo test
 
@@ -96,5 +96,5 @@ jobs:
       # rust-toolchain.toml tracks stable and would otherwise win here; remove it
       # so cargo uses the 1.85 toolchain installed above and truly tests the floor.
       - run: rm -f rust-toolchain.toml
-      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo check --all-targets
