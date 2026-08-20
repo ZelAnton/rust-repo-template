@@ -12,10 +12,29 @@ function Assert-Equal([object]$actual, [object]$expected, [string]$message) {
 
 function ConvertTo-PlainDiagnostic([AllowEmptyString()][string]$text) {
     # PowerShell may preserve terminal styling and wrap formatted error records
-    # even when stderr is redirected. Strip only ANSI CSI transport markup, then
-    # undo formatting whitespace so semantic diagnostic checks stay exact.
+    # even when stderr is redirected. Strip only ANSI CSI transport markup and
+    # the known error-record gutter, then undo formatting whitespace so semantic
+    # diagnostic checks stay exact.
     $ansiCsi = [regex]::new(([string][char]27) + '\[[0-?]*[ -/]*[@-~]')
-    ($ansiCsi.Replace($text, '') -replace '\s+', ' ').Trim()
+    $inErrorRecordGutter = $false
+    $semanticLines = foreach ($line in ($ansiCsi.Replace($text, '') -split "\r?\n")) {
+        if ($line -match '^\s*Line\s+\|\s*$') {
+            $inErrorRecordGutter = $true
+            continue
+        }
+        if ($inErrorRecordGutter) {
+            if ($line -match '^\s*\d+\s+\|' -or $line -match '^\s*\|\s*~+\s*$') {
+                continue
+            }
+            if ($line -match '^\s*\|\s?(.*)$') {
+                $Matches[1]
+                continue
+            }
+            $inErrorRecordGutter = $false
+        }
+        $line
+    }
+    (($semanticLines -join ' ') -replace '\s+', ' ').Trim()
 }
 
 function Assert-DiagnosticContains($result, [string]$expected, [string]$description) {
@@ -33,6 +52,23 @@ function Test-DiagnosticNormalization {
         (ConvertTo-PlainDiagnostic $decorated) `
         'Invalid value: CR and LF are unsupported.' `
         'ANSI diagnostic normalization did not preserve the semantic message'
+
+    $wrappedErrorRecord = @(
+        "${escape}[31;1mException: ${escape}[0m/tmp/example/scripts/init.ps1:135${escape}[0m"
+        "${escape}[31;1m${escape}[0m${escape}[36;1mLine |${escape}[0m"
+        "${escape}[31;1m${escape}[0m${escape}[36;1m${escape}[36;1m 135 | ${escape}[0m throw `"Invalid -Author: release identity values must be a single …${escape}[0m"
+        "${escape}[31;1m${escape}[0m${escape}[36;1m${escape}[36;1m${escape}[0m${escape}[36;1m     | ${escape}[31;1m         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~${escape}[0m"
+        "${escape}[31;1m${escape}[0m${escape}[36;1m${escape}[36;1m${escape}[0m${escape}[36;1m${escape}[31;1m${escape}[31;1m${escape}[36;1m     | ${escape}[31;1mInvalid -Author: release identity values must be a single line; CR and${escape}[0m"
+        "${escape}[31;1m${escape}[0m${escape}[36;1m${escape}[36;1m${escape}[0m${escape}[36;1m${escape}[31;1m${escape}[31;1m${escape}[36;1m${escape}[31;1m${escape}[36;1m     | ${escape}[31;1mLF characters are not supported.${escape}[0m"
+    ) -join "`n"
+    Assert-Equal `
+        (ConvertTo-PlainDiagnostic $wrappedErrorRecord) `
+        'Exception: /tmp/example/scripts/init.ps1:135 Invalid -Author: release identity values must be a single line; CR and LF characters are not supported.' `
+        'PowerShell error-record gutter normalization did not preserve the semantic message'
+    Assert-Equal `
+        (ConvertTo-PlainDiagnostic '135 | ordinary diagnostic output') `
+        '135 | ordinary diagnostic output' `
+        'Diagnostic normalization removed a pipe outside a PowerShell error-record gutter'
 }
 
 function Invoke-CapturedProcess(
