@@ -10,6 +10,31 @@ function Assert-Equal([object]$actual, [object]$expected, [string]$message) {
     }
 }
 
+function ConvertTo-PlainDiagnostic([AllowEmptyString()][string]$text) {
+    # PowerShell may preserve terminal styling and wrap formatted error records
+    # even when stderr is redirected. Strip only ANSI CSI transport markup, then
+    # undo formatting whitespace so semantic diagnostic checks stay exact.
+    $ansiCsi = [regex]::new(([string][char]27) + '\[[0-?]*[ -/]*[@-~]')
+    ($ansiCsi.Replace($text, '') -replace '\s+', ' ').Trim()
+}
+
+function Assert-DiagnosticContains($result, [string]$expected, [string]$description) {
+    $raw = "$($result.Stdout)`n$($result.Stderr)"
+    $plain = ConvertTo-PlainDiagnostic $raw
+    if ($plain.IndexOf($expected, [StringComparison]::Ordinal) -lt 0) {
+        throw "$description`nExpected diagnostic: $expected`nNormalized output:`n$plain`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+    }
+}
+
+function Test-DiagnosticNormalization {
+    $escape = [char]27
+    $decorated = "${escape}[31;1mInvalid value: CR and${escape}[0m`n${escape}[36;1mLF are unsupported.${escape}[0m"
+    Assert-Equal `
+        (ConvertTo-PlainDiagnostic $decorated) `
+        'Invalid value: CR and LF are unsupported.' `
+        'ANSI diagnostic normalization did not preserve the semantic message'
+}
+
 function Invoke-CapturedProcess(
     [string]$fileName,
     [string[]]$arguments,
@@ -255,9 +280,9 @@ function Test-RejectedLineBreak(
     if ($result.ExitCode -eq 0) {
         throw "$kind initializer accepted a line break in $field"
     }
-    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'single line; CR and LF characters are not supported') {
-        throw "$kind initializer returned an unclear diagnostic for a line break in $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
-    }
+    Assert-DiagnosticContains $result `
+        'single line; CR and LF characters are not supported' `
+        "$kind initializer returned an unclear diagnostic for a line break in $field."
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $field"
 }
 
@@ -296,9 +321,9 @@ function Test-RejectedGitIdentValue(
     if ($result.ExitCode -eq 0) {
         throw "$kind initializer accepted $caseName in $source $field"
     }
-    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'not preserved exactly when Git formats a commit identity') {
-        throw "$kind initializer returned an unclear diagnostic for $caseName in $source $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
-    }
+    Assert-DiagnosticContains $result `
+        'not preserved exactly when Git formats a commit identity' `
+        "$kind initializer returned an unclear diagnostic for $caseName in $source $field."
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $caseName in $source $field"
 }
 
@@ -337,9 +362,9 @@ function Test-RejectedGitConfigLineBreak(
     if ($result.ExitCode -eq 0) {
         throw "$kind initializer accepted $caseName in default git-config $field"
     }
-    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'single line; CR and LF characters are not supported') {
-        throw "$kind initializer returned an unclear diagnostic for $caseName in default git-config $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
-    }
+    Assert-DiagnosticContains $result `
+        'single line; CR and LF characters are not supported' `
+        "$kind initializer returned an unclear diagnostic for $caseName in default git-config $field."
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $caseName in default git-config $field"
 }
 
@@ -368,6 +393,8 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    Test-DiagnosticNormalization
+
     $ordinaryAuthor = 'Renée  O''Connor, "R&D" + QA'
     $ordinaryEmail = 'anne.o+release@example.com'
     $hostileAuthor = 'Eve "$(touch$IFS./init-security-name-owned)" #:[]{}&*!| suffix'
