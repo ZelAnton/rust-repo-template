@@ -81,15 +81,17 @@ function Get-InitializerInvocation(
     [string]$author,
     [string]$authorEmail,
     [switch]$UseDefaultAuthor,
-    [switch]$UseDefaultAuthorEmail
+    [switch]$UseDefaultAuthorEmail,
+    [bool]$KeepScript = $true
 ) {
     if ($kind -eq 'powershell') {
         $arguments = @(
             '-NoProfile', '-File', (Join-Path $copyRoot 'scripts/init.ps1'),
             '-ProjectName', 'init-security', '-GitHubOwner', 'example',
             '-Description', 'Initializer security regression fixture',
-            '-Year', '2026', '-KeepScript'
+            '-Year', '2026'
         )
+        if ($KeepScript) { $arguments += '-KeepScript' }
         if (-not $UseDefaultAuthor) { $arguments += @('-Author', $author) }
         if (-not $UseDefaultAuthorEmail) { $arguments += @('-AuthorEmail', $authorEmail) }
         return [pscustomobject]@{
@@ -105,7 +107,10 @@ function Get-InitializerInvocation(
     # this harness measures init.sh and Git rather than that Windows shim.
     $command = @'
 arguments=("$1" --project-name init-security --github-owner example \
-  --description "Initializer security regression fixture" --year 2026 --keep-script)
+  --description "Initializer security regression fixture" --year 2026)
+if [ "$INIT_KEEP_SCRIPT" = "1" ]; then
+  arguments+=(--keep-script)
+fi
 if [ "$INIT_USE_DEFAULT_AUTHOR" != "1" ]; then
   arguments+=(--author "$INIT_AUTHOR")
 fi
@@ -122,8 +127,32 @@ exec bash "${arguments[@]}"
             INIT_AUTHOR_EMAIL = $authorEmail
             INIT_USE_DEFAULT_AUTHOR = if ($UseDefaultAuthor) { '1' } else { '0' }
             INIT_USE_DEFAULT_AUTHOR_EMAIL = if ($UseDefaultAuthorEmail) { '1' } else { '0' }
+            INIT_KEEP_SCRIPT = if ($KeepScript) { '1' } else { '0' }
         }
     }
+}
+
+function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]$description) {
+    foreach ($relativePath in @(
+        'tests/init-security',
+        'tests/init-security/run.ps1',
+        'tests/init-security/verify-generated-workflow.py'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $copyRoot $relativePath)) {
+            throw "$description retained template-only path $relativePath"
+        }
+    }
+
+    $ciPath = Join-Path $copyRoot '.github/workflows/ci.yml'
+    $ciText = [IO.File]::ReadAllText($ciPath)
+    if ($ciText.Contains('template-only-init-security') -or $ciText.Contains('tests/init-security')) {
+        throw "$description retained the template-only security CI entrypoint"
+    }
+    $yamlCheck = Invoke-CapturedProcess $script:PythonPath @(
+        '-c', 'import pathlib, sys, yaml; yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))',
+        $ciPath
+    ) $copyRoot
+    Assert-ProcessSucceeded $yamlCheck "$description generated CI YAML parse"
 }
 
 function Test-SuccessfulInitialization(
@@ -131,7 +160,8 @@ function Test-SuccessfulInitialization(
     [ValidateSet('explicit', 'git-config')][string]$source,
     [string]$caseName,
     [string]$author,
-    [string]$authorEmail
+    [string]$authorEmail,
+    [bool]$KeepScript = $true
 ) {
     $copyRoot = Join-Path $script:TempRoot "$kind-$source-$caseName"
     Copy-Template -source $script:RepoRoot -destination $copyRoot
@@ -151,9 +181,28 @@ function Test-SuccessfulInitialization(
         }
     }
     $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail `
-        -UseDefaultAuthor:$useDefaults -UseDefaultAuthorEmail:$useDefaults
+        -UseDefaultAuthor:$useDefaults -UseDefaultAuthorEmail:$useDefaults -KeepScript:$KeepScript
     $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
     Assert-ProcessSucceeded $result "$kind initializer ($source $caseName)"
+    Assert-TemplateOnlySecurityArtifactsRemoved $copyRoot "$kind initializer ($source $caseName)"
+
+    foreach ($initializer in @('scripts/init.ps1', 'scripts/init.sh')) {
+        $exists = Test-Path -LiteralPath (Join-Path $copyRoot $initializer)
+        if ($exists -ne $KeepScript) {
+            throw "$kind initializer ($source $caseName) produced an unexpected keep-script result for $initializer"
+        }
+    }
+
+    if (-not $KeepScript) {
+        foreach ($check in @(
+            @{ FileName = 'yamllint'; Arguments = @('.'); Description = 'downstream YAML lint' },
+            @{ FileName = 'cargo'; Arguments = @('fmt', '--all', '--', '--check'); Description = 'downstream rustfmt' },
+            @{ FileName = 'cargo'; Arguments = @('check', '--all-targets'); Description = 'downstream cargo check' }
+        )) {
+            $checkResult = Invoke-CapturedProcess $check.FileName $check.Arguments $copyRoot
+            Assert-ProcessSucceeded $checkResult "$kind initializer ($source $caseName) $($check.Description)"
+        }
+    }
 
     $verifyArguments = @(
         $script:VerifierPath, '--repo', $copyRoot, '--bash', $script:BashPath,
@@ -301,6 +350,10 @@ try {
     $psOrdinary = Test-SuccessfulInitialization powershell explicit ordinary $ordinaryAuthor $ordinaryEmail
     $shOrdinary = Test-SuccessfulInitialization posix explicit ordinary $ordinaryAuthor $ordinaryEmail
     Assert-Equal $shOrdinary $psOrdinary 'Initializers generated different ordinary release workflows'
+
+    $psStandard = Test-SuccessfulInitialization powershell explicit standard-no-keep $ordinaryAuthor $ordinaryEmail -KeepScript:$false
+    $shStandard = Test-SuccessfulInitialization posix explicit standard-no-keep $ordinaryAuthor $ordinaryEmail -KeepScript:$false
+    Assert-Equal $shStandard $psStandard 'Standard initializers generated different release workflows'
 
     $psHostile = Test-SuccessfulInitialization powershell explicit hostile $hostileAuthor $hostileEmail
     $shHostile = Test-SuccessfulInitialization posix explicit hostile $hostileAuthor $hostileEmail

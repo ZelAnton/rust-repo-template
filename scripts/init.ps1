@@ -9,8 +9,9 @@
     Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
     __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder
     names, then removes the template-only files (TEMPLATE.md,
-    docs/AGENT-INIT-GUIDE.md, and — unless -KeepScript — both initializers,
-    init.ps1 and init.sh).
+    docs/AGENT-INIT-GUIDE.md, the initializer security regression harness and
+    its CI step, and — unless -KeepScript — both initializers, init.ps1 and
+    init.sh).
 
     Run it once, right after creating a repository from the template:
 
@@ -209,6 +210,20 @@ $releaseWorkflowReplacements['__AuthorEmail__'] = [Convert]::ToBase64String(
 $releaseWorkflowPath = [IO.Path]::GetFullPath(
     (Join-Path $repoRoot '.github/workflows/release.yml')
 )
+$ciWorkflowPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot '.github/workflows/ci.yml')
+)
+$templateSecurityTestsPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot 'tests/init-security')
+)
+$pathComparison = if ($IsWindows) {
+    [StringComparison]::OrdinalIgnoreCase
+} else {
+    [StringComparison]::Ordinal
+}
+$templateOnlyCiPattern = [regex]::new(
+    '(?ms)^[ \t]*# template-only-init-security: begin\r?\n.*?^[ \t]*# template-only-init-security: end\r?\n?'
+)
 
 # Values written into TOML files (Cargo.toml description/repository) sit inside
 # double-quoted strings — a literal " or \ in an author/description would break
@@ -222,6 +237,16 @@ $tomlFileExtensions = @('.toml')
 $excludedDirs = @('.git', '.jj', 'target')
 
 function Test-Excluded([string]$fullPath) {
+    $canonicalPath = [IO.Path]::GetFullPath($fullPath)
+    if (
+        $canonicalPath.Equals($templateSecurityTestsPath, $pathComparison) -or
+        $canonicalPath.StartsWith(
+            $templateSecurityTestsPath + [IO.Path]::DirectorySeparatorChar,
+            $pathComparison
+        )
+    ) {
+        return $true
+    }
     $rel = $fullPath.Substring($repoRoot.Length).TrimStart('\', '/')
     foreach ($seg in ($rel -split '[\\/]')) {
         if ($excludedDirs -contains $seg) { return $true }
@@ -251,6 +276,13 @@ foreach ($file in $files) {
     }
     foreach ($key in $map.Keys) {
         $new = $new.Replace($key, $map[$key])
+    }
+    if ([IO.Path]::GetFullPath($file.FullName) -eq $ciWorkflowPath) {
+        $templateOnlyMatches = $templateOnlyCiPattern.Matches($new)
+        if ($templateOnlyMatches.Count -ne 1) {
+            throw "Expected exactly one template-only init-security block in .github/workflows/ci.yml; found $($templateOnlyMatches.Count)."
+        }
+        $new = $templateOnlyCiPattern.Replace($new, '', 1)
     }
     if ($new -ne $text) {
         # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
@@ -288,6 +320,10 @@ $templateOnly = @('TEMPLATE.md', 'docs/AGENT-INIT-GUIDE.md')
 foreach ($rel in $templateOnly) {
     $p = Join-Path $repoRoot $rel
     if (Test-Path $p) { Remove-Item -LiteralPath $p -Force }
+}
+$templateSecurityTests = Join-Path $repoRoot 'tests/init-security'
+if (Test-Path -LiteralPath $templateSecurityTests) {
+    Remove-Item -LiteralPath $templateSecurityTests -Recurse -Force
 }
 # Drop docs/ if it's now empty.
 $docsDir = Join-Path $repoRoot 'docs'

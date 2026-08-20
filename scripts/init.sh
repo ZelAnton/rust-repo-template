@@ -5,8 +5,9 @@
 #
 # Replaces the placeholder tokens (__ProjectName__, __Author__, __AuthorEmail__,
 # __GitHubOwner__, __Description__, __Year__) in file contents AND in file/folder names,
-# then removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md)
-# and — unless --keep-script — both initializers (init.sh and init.ps1).
+# then removes the template-only files (TEMPLATE.md, docs/AGENT-INIT-GUIDE.md,
+# the initializer security regression harness and its CI step) and — unless
+# --keep-script — both initializers (init.sh and init.ps1).
 #
 # Usage:
 #   bash ./scripts/init.sh --project-name my-tool \
@@ -124,6 +125,8 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
 release_workflow="$repo_root/.github/workflows/release.yml"
+ci_workflow="$repo_root/.github/workflows/ci.yml"
+security_tests="$repo_root/tests/init-security"
 
 # In release.yml the author placeholders are data, not Bash source. Base64 keeps
 # every shell/YAML metacharacter out of the serialized workflow while preserving
@@ -180,7 +183,7 @@ substitute_tokens() {
 changed=0
 while IFS= read -r -d '' file; do
   case "$file" in
-    "$self"|"$sibling_ps1") continue ;;
+    "$self"|"$sibling_ps1"|"$security_tests"/*) continue ;;
   esac
   case "$file" in
     *.toml) c=$crate_t; a=$author_t; ae=$author_email_t; o=$owner_t; d=$desc_t; y=$year_t ;;
@@ -201,6 +204,30 @@ while IFS= read -r -d '' file; do
   fi
 done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name target \) -prune -o -type f -print0)
 echo "    Updated contents in $changed file(s)."
+
+# The security harness tests the template's initializer implementation. It is
+# not a downstream project check, so remove its workflow block together with
+# the harness instead of leaving a CI step that targets deleted init scripts.
+ci_without_template_step="$ci_workflow.template-only.$$"
+if ! awk '
+  /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
+    if (inside || seen) exit 42
+    inside = 1
+    seen = 1
+    next
+  }
+  /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
+    if (!inside) exit 42
+    inside = 0
+    next
+  }
+  !inside { print }
+  END { if (inside || seen != 1) exit 42 }
+' "$ci_workflow" > "$ci_without_template_step"; then
+  rm -f "$ci_without_template_step"
+  die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
+fi
+mv -f "$ci_without_template_step" "$ci_workflow"
 
 # 2) Rename files and folders whose name contains the crate-name token. -depth
 #    processes children before parents so a renamed dir doesn't invalidate paths.
@@ -228,6 +255,7 @@ fi
 # 4) Remove template-only files (the agent guide is template meta — pitfalls are
 #    logged back to the *template's* copy, so the downstream repo drops it).
 rm -f "$repo_root/TEMPLATE.md" "$repo_root/docs/AGENT-INIT-GUIDE.md"
+rm -rf "$security_tests"
 # Drop docs/ if it's now empty.
 rmdir "$repo_root/docs" 2>/dev/null || true
 

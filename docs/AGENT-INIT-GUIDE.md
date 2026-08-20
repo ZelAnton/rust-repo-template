@@ -82,7 +82,8 @@ Confirm these facts by reading, not by assuming:
    The crate name is required; the rest fall back to sensible defaults. The
    script substitutes tokens (TOML-escaped for `Cargo.toml`), renames any
    token-named files/folders, and deletes `TEMPLATE.md`,
-   `docs/AGENT-INIT-GUIDE.md`, and both initializers (unless `-KeepScript` /
+   `docs/AGENT-INIT-GUIDE.md`, the template-only initializer security harness
+   and its CI step, and both initializers (unless `-KeepScript` /
    `--keep-script`). Run **one** initializer, not both.
 4. **Verify**:
 
@@ -204,6 +205,18 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-08-20 — template-only initializer checks leaked downstream
+- **Symptom:** An initialized repo retained the initializer security CI step and
+  verifier even though a standard init deleted both init scripts. Author names
+  containing quotes were also substituted into the verifier's Python literals,
+  making that retained test syntactically invalid.
+- **Root cause:** The global token pass treated template regression fixtures as
+  downstream source, while cleanup removed neither the harness nor its CI entry.
+- **Rule:** Exclude template-only fixtures from token substitution and remove
+  them together with a marked CI block on every initialization. Exercise both
+  PowerShell and POSIX generated copies without the keep flag so dangling
+  template-only entrypoints cannot pass template-side tests.
 
 ### 2026-06-04 — init.sh emitted an unbuildable Cargo.toml on a backslash
 - **Symptom:** `scripts/init.sh --description 'runs on C:\Windows'` wrote

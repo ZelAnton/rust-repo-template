@@ -36,11 +36,13 @@ jobs:
       - name: Lint YAML
         run: yamllint .
 
-      # yamllint installs PyYAML, which the regression harness also uses to
-      # validate each generated release workflow before exercising its commit step.
+      # template-only-init-security: begin
+      # yamllint installs PyYAML, which this template-only regression harness
+      # uses before initialization removes the harness and this CI step.
       - name: Test initializer release identity safety
         shell: pwsh
         run: ./tests/init-security/run.ps1
+      # template-only-init-security: end
 
   fmt:
     name: rustfmt
