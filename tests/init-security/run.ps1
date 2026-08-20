@@ -174,6 +174,47 @@ function Test-RejectedAngleBracket(
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting '$character' in $field"
 }
 
+function Test-RejectedEdgeWhitespace(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('author', 'email')][string]$field,
+    [ValidateSet('explicit', 'git-config')][string]$source,
+    [string]$caseName,
+    [string]$value
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-reject-$source-$field-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $author = if ($field -eq 'author') { $value } else { 'Valid  Name, QA' }
+    $authorEmail = if ($field -eq 'email') { $value } else { 'valid.release+qa@example.com' }
+    $useDefaultAuthor = $false
+    $useDefaultEmail = $false
+
+    if ($source -eq 'git-config') {
+        $init = Invoke-CapturedProcess 'git' @('init', '-q') $copyRoot
+        Assert-ProcessSucceeded $init "git init for $kind $source $field $caseName"
+        $key = if ($field -eq 'author') { 'user.name' } else { 'user.email' }
+        $configured = Invoke-CapturedProcess 'git' @('config', '--local', $key, $value) $copyRoot
+        Assert-ProcessSucceeded $configured "git config for $kind $source $field $caseName"
+        $raw = Invoke-CapturedProcess 'git' @('config', '--null', '--get', $key) $copyRoot
+        Assert-ProcessSucceeded $raw "read-back git config for $kind $source $field $caseName"
+        Assert-Equal $raw.Stdout ($value + "`0") "git did not preserve the $caseName fixture exactly"
+        $useDefaultAuthor = $field -eq 'author'
+        $useDefaultEmail = $field -eq 'email'
+    }
+
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail `
+        -UseDefaultAuthor:$useDefaultAuthor -UseDefaultAuthorEmail:$useDefaultEmail
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted $caseName in $source $field"
+    }
+    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'must not start or end with ASCII whitespace because Git strips it') {
+        throw "$kind initializer returned an unclear diagnostic for $caseName in $source $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+    }
+    Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $caseName in $source $field"
+}
+
 function Test-RejectedGitConfigLineBreak(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('author', 'email')][string]$field,
@@ -240,7 +281,7 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
-    $ordinaryAuthor = 'Renée O''Connor, "R&D" + QA'
+    $ordinaryAuthor = 'Renée  O''Connor, "R&D" + QA'
     $ordinaryEmail = 'anne.o+release@example.com'
     $hostileAuthor = 'Eve "$(touch$IFS./init-security-name-owned)" #:[]{}&*!| suffix'
     $hostileEmail = 'attacker+$(touch$IFS./init-security-email-owned)@example.com'
@@ -267,6 +308,20 @@ try {
                 @{ Name = 'trailing-cr'; Value = "LineBreak`r" }
             )) {
                 Test-RejectedGitConfigLineBreak $kind $field $case.Name $case.Value
+            }
+            foreach ($source in @('explicit', 'git-config')) {
+                foreach ($case in @(
+                    @{ Name = 'leading-space'; Value = ' Edge' },
+                    @{ Name = 'trailing-space'; Value = 'Edge ' },
+                    @{ Name = 'leading-tab'; Value = "`tEdge" },
+                    @{ Name = 'trailing-tab'; Value = "Edge`t" },
+                    @{ Name = 'leading-vertical-tab'; Value = "`vEdge" },
+                    @{ Name = 'trailing-vertical-tab'; Value = "Edge`v" },
+                    @{ Name = 'leading-form-feed'; Value = "`fEdge" },
+                    @{ Name = 'trailing-form-feed'; Value = "Edge`f" }
+                )) {
+                    Test-RejectedEdgeWhitespace $kind $field $source $case.Name $case.Value
+                }
             }
         }
     }

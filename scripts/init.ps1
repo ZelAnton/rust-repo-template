@@ -138,6 +138,9 @@ function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
     if ($value -match '[<>]') {
         throw "Invalid -${parameterName}: release identity values must not contain '<' or '>' because Git strips those characters from commit identities."
     }
+    if ($value -match '^[ \t\v\f]|[ \t\v\f]$') {
+        throw "Invalid -${parameterName}: release identity values must not start or end with ASCII whitespace because Git strips it from commit identities."
+    }
 }
 
 Assert-ReleaseIdentityValue -parameterName 'Author' -value $Author

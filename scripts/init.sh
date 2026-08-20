@@ -95,6 +95,11 @@ validate_release_identity() {
       die "invalid $1: release identity values must not contain '<' or '>' because Git strips those characters from commit identities."
       ;;
   esac
+  case "$2" in
+    ' '*|*' '|$'\t'*|*$'\t'|$'\v'*|*$'\v'|$'\f'*|*$'\f')
+      die "invalid $1: release identity values must not start or end with ASCII whitespace because Git strips it from commit identities."
+      ;;
+  esac
 }
 
 # Command substitution strips trailing newlines after decoding, and Git
