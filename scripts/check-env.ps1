@@ -5,11 +5,11 @@
     the template.
 
 .DESCRIPTION
-    Verifies the Rust toolchain (cargo + rustc) is on PATH. rust-toolchain.toml
+    Verifies cargo and rustc can each report a usable version. rust-toolchain.toml
     pins the channel and components (rustfmt, clippy), which rustup installs
-    automatically on the first build, so only cargo/rustc need to be present.
-    Prints "Environment ready" and exits 0 on success; if the toolchain is missing
-    it prints per-OS install commands and exits 1 — install it, then re-run.
+    automatically on the first build. Prints "Environment ready" and exits 0
+    only after both checks succeed; otherwise it reports every failed check and
+    exits 1.
 
     Run it first, before scripts/init.ps1:
 
@@ -23,16 +23,37 @@ $problems = @()
 
 Write-Host "==> Checking environment for Rust development" -ForegroundColor Cyan
 
-# Required: cargo (build/test driver) and rustc (the compiler).
-if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    $problems += "cargo ('cargo' is not on PATH)"
-}
-if (-not (Get-Command rustc -ErrorAction SilentlyContinue)) {
-    $problems += "the Rust compiler ('rustc' is not on PATH)"
-}
-if ($problems.Count -eq 0) {
-    $ver = (& rustc --version) 2>$null
-    Write-Host "    $ver" -ForegroundColor DarkGray
+# Required: cargo (build/test driver) and rustc (the compiler). Resolve only
+# applications so a same-named shell function cannot stand in for the tool.
+foreach ($tool in @('cargo', 'rustc')) {
+    $command = Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $command) {
+        $problems += "$tool ('$tool' is not on PATH)"
+        continue
+    }
+
+    try {
+        $versionOutput = ((& $command.Source --version 2>$null) | Out-String).Trim()
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        $problems += "$tool ('$tool --version' could not be executed)"
+        continue
+    }
+
+    if ($exitCode -ne 0) {
+        $problems += "$tool ('$tool --version' exited with code $exitCode)"
+    }
+    elseif ([string]::IsNullOrWhiteSpace($versionOutput)) {
+        $problems += "$tool ('$tool --version' returned empty output)"
+    }
+    elseif ($versionOutput -notmatch "^$tool\s+\S+") {
+        $problems += "$tool ('$tool --version' returned unusable output)"
+    }
+    else {
+        Write-Host "    $versionOutput" -ForegroundColor DarkGray
+    }
 }
 
 if ($problems.Count -eq 0) {
@@ -43,7 +64,7 @@ if ($problems.Count -eq 0) {
 }
 
 Write-Host ""
-Write-Host "Environment NOT ready. Missing:" -ForegroundColor Red
+Write-Host "Environment NOT ready. Problems:" -ForegroundColor Red
 foreach ($p in $problems) { Write-Host "  - $p" -ForegroundColor Red }
 Write-Host ""
 Write-Host "Install the Rust toolchain via rustup, then re-run this check:" -ForegroundColor Yellow
