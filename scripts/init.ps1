@@ -260,7 +260,7 @@ Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
 #    the literal token strings as search keys, so substituting inside them would
 #    corrupt the sibling script.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
-$files = Get-ChildItem -Path $repoRoot -File -Recurse | Where-Object {
+$files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
     -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
 }
 $contentChanged = 0
@@ -296,7 +296,7 @@ Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor D
 #    Deepest paths first so child renames don't invalidate parent paths.
 #    (The single-crate skeleton has none, but workspace adaptations may add
 #    `crates/__ProjectName__` etc., so support it.)
-$named = Get-ChildItem -Path $repoRoot -Recurse | Where-Object {
+$named = Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
     -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
 } | Sort-Object { $_.FullName.Length } -Descending
 foreach ($item in $named) {

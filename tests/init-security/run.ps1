@@ -155,6 +155,30 @@ function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]
     Assert-ProcessSucceeded $yamlCheck "$description generated CI YAML parse"
 }
 
+function Add-HiddenInitializerFixture([string]$copyRoot) {
+    $fixtureRoot = Join-Path $copyRoot '.initializer-hidden-fixture'
+    $fixtureDirectory = New-Item -ItemType Directory -Path $fixtureRoot
+    if ($IsWindows) {
+        $fixtureDirectory.Attributes = $fixtureDirectory.Attributes -bor [IO.FileAttributes]::Hidden
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $fixtureRoot '__ProjectName__-fixture.txt'),
+        '__Description__',
+        (New-Object Text.UTF8Encoding($false))
+    )
+}
+
+function Assert-HiddenInitializerFixtureUpdated([string]$copyRoot, [string]$description) {
+    $fixturePath = Join-Path $copyRoot '.initializer-hidden-fixture/init-security-fixture.txt'
+    if (-not (Test-Path -LiteralPath $fixturePath)) {
+        throw "$description did not rename a tokenized file inside a hidden directory"
+    }
+    Assert-Equal `
+        ([IO.File]::ReadAllText($fixturePath)) `
+        'Initializer security regression fixture' `
+        "$description did not replace content inside a hidden directory"
+}
+
 function Test-SuccessfulInitialization(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('explicit', 'git-config')][string]$source,
@@ -165,6 +189,7 @@ function Test-SuccessfulInitialization(
 ) {
     $copyRoot = Join-Path $script:TempRoot "$kind-$source-$caseName"
     Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-HiddenInitializerFixture $copyRoot
     $useDefaults = $source -eq 'git-config'
     if ($useDefaults) {
         $init = Invoke-CapturedProcess 'git' @('init', '-q') $copyRoot
@@ -185,6 +210,7 @@ function Test-SuccessfulInitialization(
     $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
     Assert-ProcessSucceeded $result "$kind initializer ($source $caseName)"
     Assert-TemplateOnlySecurityArtifactsRemoved $copyRoot "$kind initializer ($source $caseName)"
+    Assert-HiddenInitializerFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
 
     foreach ($initializer in @('scripts/init.ps1', 'scripts/init.sh')) {
         $exists = Test-Path -LiteralPath (Join-Path $copyRoot $initializer)
