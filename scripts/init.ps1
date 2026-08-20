@@ -133,13 +133,48 @@ function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
     if ($value -match '[\r\n]') {
         throw "Invalid -${parameterName}: release identity values must be a single line; CR and LF characters are not supported."
     }
-    # Git removes angle brackets while formatting an author ident, so accepting
-    # either character would silently change the public release-commit identity.
-    if ($value -match '[<>]') {
-        throw "Invalid -${parameterName}: release identity values must not contain '<' or '>' because Git strips those characters from commit identities."
-    }
-    if ($value -match '^[ \t\v\f]|[ \t\v\f]$') {
-        throw "Invalid -${parameterName}: release identity values must not start or end with ASCII whitespace because Git strips it from commit identities."
+
+    # Git's ident formatter strips a wider set of boundary punctuation than its
+    # config store does. Probe the formatter itself so accepted values have a
+    # lossless contract even if that set changes, instead of maintaining a
+    # second, inevitably incomplete blacklist in this initializer.
+    $probeName = if ($parameterName -eq 'Author') { $value } else { 'Release Identity Probe' }
+    $probeEmail = if ($parameterName -eq 'AuthorEmail') { $value } else { 'probe@example.invalid' }
+    $expected = "$probeName <$probeEmail> 0 +0000"
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    $startInfo.Environment['GIT_AUTHOR_NAME'] = $probeName
+    $startInfo.Environment['GIT_AUTHOR_EMAIL'] = $probeEmail
+    $startInfo.Environment['GIT_AUTHOR_DATE'] = '@0 +0000'
+    [void]$startInfo.ArgumentList.Add('var')
+    [void]$startInfo.ArgumentList.Add('GIT_AUTHOR_IDENT')
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Invalid -${parameterName}: Git could not validate the release identity value."
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $rendered = $stdout.GetAwaiter().GetResult()
+        [void]$stderr.GetAwaiter().GetResult()
+        if ($rendered.EndsWith("`r`n", [StringComparison]::Ordinal)) {
+            $rendered = $rendered.Substring(0, $rendered.Length - 2)
+        } elseif ($rendered.EndsWith("`n", [StringComparison]::Ordinal)) {
+            $rendered = $rendered.Substring(0, $rendered.Length - 1)
+        }
+        if ($process.ExitCode -ne 0 -or $rendered -cne $expected) {
+            throw "Invalid -${parameterName}: release identity value is not preserved exactly when Git formats a commit identity; Git would strip or alter characters."
+        }
+    } finally {
+        $process.Dispose()
     }
 }
 

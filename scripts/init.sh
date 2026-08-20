@@ -90,16 +90,27 @@ validate_release_identity() {
       die "invalid $1: release identity values must be a single line; CR and LF characters are not supported."
       ;;
   esac
-  case "$2" in
-    *'<'*|*'>'*)
-      die "invalid $1: release identity values must not contain '<' or '>' because Git strips those characters from commit identities."
-      ;;
-  esac
-  case "$2" in
-    ' '*|*' '|$'\t'*|*$'\t'|$'\v'*|*$'\v'|$'\f'*|*$'\f')
-      die "invalid $1: release identity values must not start or end with ASCII whitespace because Git strips it from commit identities."
-      ;;
-  esac
+
+  # Ask Git's ident formatter to round-trip each value against a fixed safe
+  # counterpart. Git strips more boundary punctuation than its config store;
+  # probing the formatter keeps this contract complete without duplicating its
+  # evolving internal blacklist here.
+  if [ "$1" = "--author" ]; then
+    probe_name="$2"
+    probe_email="probe@example.invalid"
+  else
+    probe_name="Release Identity Probe"
+    probe_email="$2"
+  fi
+  expected_ident="$probe_name <$probe_email> 0 +0000"
+  rendered_ident="$(
+    GIT_AUTHOR_NAME="$probe_name" \
+    GIT_AUTHOR_EMAIL="$probe_email" \
+    GIT_AUTHOR_DATE='@0 +0000' \
+      git var GIT_AUTHOR_IDENT 2>/dev/null
+  )" || die "invalid $1: Git could not validate the release identity value."
+  [ "$rendered_ident" = "$expected_ident" ] ||
+    die "invalid $1: release identity value is not preserved exactly when Git formats a commit identity; Git would strip or alter characters."
 }
 
 # Command substitution strips trailing newlines after decoding, and Git

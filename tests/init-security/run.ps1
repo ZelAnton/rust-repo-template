@@ -13,7 +13,8 @@ function Assert-Equal([object]$actual, [object]$expected, [string]$message) {
 function Invoke-CapturedProcess(
     [string]$fileName,
     [string[]]$arguments,
-    [string]$workingDirectory
+    [string]$workingDirectory,
+    [Collections.IDictionary]$environment = @{}
 ) {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $fileName
@@ -21,6 +22,9 @@ function Invoke-CapturedProcess(
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    foreach ($entry in $environment.GetEnumerator()) {
+        $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
+    }
     foreach ($argument in $arguments) {
         [void]$startInfo.ArgumentList.Add($argument)
     }
@@ -91,41 +95,72 @@ function Get-InitializerInvocation(
         return [pscustomobject]@{
             FileName = $script:PwshPath
             Arguments = $arguments
+            Environment = @{}
         }
     }
 
-    $arguments = @(
-        (Join-Path $copyRoot 'scripts/init.sh'),
-        '--project-name', 'init-security', '--github-owner', 'example',
-        '--description', 'Initializer security regression fixture',
-        '--year', '2026', '--keep-script'
-    )
-    if (-not $UseDefaultAuthor) { $arguments += @('--author', $author) }
-    if (-not $UseDefaultAuthorEmail) { $arguments += @('--author-email', $authorEmail) }
+    # MSYS2 reparses the Windows command line before Bash sees argv and can
+    # consume leading quote/backslash characters. Carry identity fixtures in
+    # the environment, then construct the real initializer argv inside Bash so
+    # this harness measures init.sh and Git rather than that Windows shim.
+    $command = @'
+arguments=("$1" --project-name init-security --github-owner example \
+  --description "Initializer security regression fixture" --year 2026 --keep-script)
+if [ "$INIT_USE_DEFAULT_AUTHOR" != "1" ]; then
+  arguments+=(--author "$INIT_AUTHOR")
+fi
+if [ "$INIT_USE_DEFAULT_AUTHOR_EMAIL" != "1" ]; then
+  arguments+=(--author-email "$INIT_AUTHOR_EMAIL")
+fi
+exec bash "${arguments[@]}"
+'@
     [pscustomobject]@{
         FileName = $script:BashPath
-        Arguments = $arguments
+        Arguments = @('-c', $command, 'init-security-wrapper', (Join-Path $copyRoot 'scripts/init.sh'))
+        Environment = @{
+            INIT_AUTHOR = $author
+            INIT_AUTHOR_EMAIL = $authorEmail
+            INIT_USE_DEFAULT_AUTHOR = if ($UseDefaultAuthor) { '1' } else { '0' }
+            INIT_USE_DEFAULT_AUTHOR_EMAIL = if ($UseDefaultAuthorEmail) { '1' } else { '0' }
+        }
     }
 }
 
 function Test-SuccessfulInitialization(
     [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('explicit', 'git-config')][string]$source,
     [string]$caseName,
     [string]$author,
     [string]$authorEmail
 ) {
-    $copyRoot = Join-Path $script:TempRoot "$kind-$caseName"
+    $copyRoot = Join-Path $script:TempRoot "$kind-$source-$caseName"
     Copy-Template -source $script:RepoRoot -destination $copyRoot
-    $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail
-    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
-    Assert-ProcessSucceeded $result "$kind initializer ($caseName)"
+    $useDefaults = $source -eq 'git-config'
+    if ($useDefaults) {
+        $init = Invoke-CapturedProcess 'git' @('init', '-q') $copyRoot
+        Assert-ProcessSucceeded $init "git init for $kind $source $caseName"
+        foreach ($entry in @(
+            @('user.name', $author),
+            @('user.email', $authorEmail)
+        )) {
+            $configured = Invoke-CapturedProcess 'git' @('config', '--local', $entry[0], $entry[1]) $copyRoot
+            Assert-ProcessSucceeded $configured "git config for $kind $source $caseName"
+            $raw = Invoke-CapturedProcess 'git' @('config', '--null', '--get', $entry[0]) $copyRoot
+            Assert-ProcessSucceeded $raw "read-back git config for $kind $source $caseName"
+            Assert-Equal $raw.Stdout ($entry[1] + "`0") "git config changed $($entry[0]) for $kind $source $caseName"
+        }
+    }
+    $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail `
+        -UseDefaultAuthor:$useDefaults -UseDefaultAuthorEmail:$useDefaults
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind initializer ($source $caseName)"
 
     $verifyArguments = @(
         $script:VerifierPath, '--repo', $copyRoot, '--bash', $script:BashPath,
         '--expected-name', $author, '--expected-email', $authorEmail
     )
     $verification = Invoke-CapturedProcess $script:PythonPath $verifyArguments $copyRoot
-    Assert-ProcessSucceeded $verification "$kind generated workflow verification ($caseName)"
+    Assert-ProcessSucceeded $verification "$kind generated workflow verification ($source $caseName)"
 
     [IO.File]::ReadAllText((Join-Path $copyRoot '.github/workflows/release.yml'))
 }
@@ -140,7 +175,7 @@ function Test-RejectedLineBreak(
     $author = if ($field -eq 'author') { "Line`nBreak" } else { 'Valid Name' }
     $authorEmail = if ($field -eq 'email') { "line`rbreak@example.com" } else { 'valid@example.com' }
     $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail
-    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
 
     if ($result.ExitCode -eq 0) {
         throw "$kind initializer accepted a line break in $field"
@@ -151,30 +186,7 @@ function Test-RejectedLineBreak(
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $field"
 }
 
-function Test-RejectedAngleBracket(
-    [ValidateSet('powershell', 'posix')][string]$kind,
-    [ValidateSet('author', 'email')][string]$field,
-    [ValidateSet('<', '>')][string]$character
-) {
-    $label = if ($character -eq '<') { 'open' } else { 'close' }
-    $copyRoot = Join-Path $script:TempRoot "$kind-reject-$field-angle-$label"
-    Copy-Template -source $script:RepoRoot -destination $copyRoot
-    $before = Get-TreeFingerprint $copyRoot
-    $author = if ($field -eq 'author') { "Angle ${character}Name" } else { 'Valid Name' }
-    $authorEmail = if ($field -eq 'email') { "angle${character}mail@example.com" } else { 'valid@example.com' }
-    $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail
-    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
-
-    if ($result.ExitCode -eq 0) {
-        throw "$kind initializer accepted '$character' in $field"
-    }
-    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch "must not contain '<' or '>' because Git strips those characters") {
-        throw "$kind initializer returned an unclear diagnostic for '$character' in $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
-    }
-    Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting '$character' in $field"
-}
-
-function Test-RejectedEdgeWhitespace(
+function Test-RejectedGitIdentValue(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('author', 'email')][string]$field,
     [ValidateSet('explicit', 'git-config')][string]$source,
@@ -204,12 +216,12 @@ function Test-RejectedEdgeWhitespace(
     $before = Get-TreeFingerprint $copyRoot
     $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail `
         -UseDefaultAuthor:$useDefaultAuthor -UseDefaultAuthorEmail:$useDefaultEmail
-    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
 
     if ($result.ExitCode -eq 0) {
         throw "$kind initializer accepted $caseName in $source $field"
     }
-    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'must not start or end with ASCII whitespace because Git strips it') {
+    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'not preserved exactly when Git formats a commit identity') {
         throw "$kind initializer returned an unclear diagnostic for $caseName in $source $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
     }
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $caseName in $source $field"
@@ -245,7 +257,7 @@ function Test-RejectedGitConfigLineBreak(
     $useDefaultEmail = $field -eq 'email'
     $invocation = Get-InitializerInvocation $kind $copyRoot 'Valid Name' 'valid@example.com' `
         -UseDefaultAuthor:$useDefaultAuthor -UseDefaultAuthorEmail:$useDefaultEmail
-    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
 
     if ($result.ExitCode -eq 0) {
         throw "$kind initializer accepted $caseName in default git-config $field"
@@ -286,21 +298,35 @@ try {
     $hostileAuthor = 'Eve "$(touch$IFS./init-security-name-owned)" #:[]{}&*!| suffix'
     $hostileEmail = 'attacker+$(touch$IFS./init-security-email-owned)@example.com'
 
-    $psOrdinary = Test-SuccessfulInitialization powershell ordinary $ordinaryAuthor $ordinaryEmail
-    $shOrdinary = Test-SuccessfulInitialization posix ordinary $ordinaryAuthor $ordinaryEmail
+    $psOrdinary = Test-SuccessfulInitialization powershell explicit ordinary $ordinaryAuthor $ordinaryEmail
+    $shOrdinary = Test-SuccessfulInitialization posix explicit ordinary $ordinaryAuthor $ordinaryEmail
     Assert-Equal $shOrdinary $psOrdinary 'Initializers generated different ordinary release workflows'
 
-    $psHostile = Test-SuccessfulInitialization powershell hostile $hostileAuthor $hostileEmail
-    $shHostile = Test-SuccessfulInitialization posix hostile $hostileAuthor $hostileEmail
+    $psHostile = Test-SuccessfulInitialization powershell explicit hostile $hostileAuthor $hostileEmail
+    $shHostile = Test-SuccessfulInitialization posix explicit hostile $hostileAuthor $hostileEmail
     Assert-Equal $shHostile $psHostile 'Initializers generated different hostile release workflows'
+
+    # Git preserves this punctuation internally and permits '.' at either edge.
+    # Exercise the actual release commit for both initializer and input channels
+    # so the lossless guard does not grow into an over-broad punctuation ban.
+    $roundTripAuthor = '.Edge "double" ''single'', colon: semicolon; backslash\ exact.'
+    $roundTripEmail = '.edge"double"''single'',colon:semicolon;backslash\exact.@example.com.'
+    $roundTripWorkflow = $null
+    foreach ($source in @('explicit', 'git-config')) {
+        $psRoundTrip = Test-SuccessfulInitialization powershell $source allowed-punctuation $roundTripAuthor $roundTripEmail
+        $shRoundTrip = Test-SuccessfulInitialization posix $source allowed-punctuation $roundTripAuthor $roundTripEmail
+        Assert-Equal $shRoundTrip $psRoundTrip "Initializers generated different allowed-punctuation workflows for $source input"
+        if ($null -eq $roundTripWorkflow) {
+            $roundTripWorkflow = $psRoundTrip
+        } else {
+            Assert-Equal $psRoundTrip $roundTripWorkflow 'Explicit and git-config inputs generated different allowed-punctuation workflows'
+        }
+    }
 
     foreach ($kind in @('powershell', 'posix')) {
         Test-RejectedLineBreak $kind author
         Test-RejectedLineBreak $kind email
         foreach ($field in @('author', 'email')) {
-            foreach ($character in @('<', '>')) {
-                Test-RejectedAngleBracket $kind $field $character
-            }
             foreach ($case in @(
                 @{ Name = 'internal-lf'; Value = "Line`nBreak" },
                 @{ Name = 'internal-cr'; Value = "Line`rBreak" },
@@ -311,6 +337,8 @@ try {
             }
             foreach ($source in @('explicit', 'git-config')) {
                 foreach ($case in @(
+                    @{ Name = 'internal-open-angle'; Value = 'Angle<Edge' },
+                    @{ Name = 'internal-close-angle'; Value = 'Angle>Edge' },
                     @{ Name = 'leading-space'; Value = ' Edge' },
                     @{ Name = 'trailing-space'; Value = 'Edge ' },
                     @{ Name = 'leading-tab'; Value = "`tEdge" },
@@ -318,9 +346,21 @@ try {
                     @{ Name = 'leading-vertical-tab'; Value = "`vEdge" },
                     @{ Name = 'trailing-vertical-tab'; Value = "Edge`v" },
                     @{ Name = 'leading-form-feed'; Value = "`fEdge" },
-                    @{ Name = 'trailing-form-feed'; Value = "Edge`f" }
+                    @{ Name = 'trailing-form-feed'; Value = "Edge`f" },
+                    @{ Name = 'leading-double-quote'; Value = '"Edge' },
+                    @{ Name = 'trailing-double-quote'; Value = 'Edge"' },
+                    @{ Name = 'leading-single-quote'; Value = "'Edge" },
+                    @{ Name = 'trailing-single-quote'; Value = "Edge'" },
+                    @{ Name = 'leading-comma'; Value = ',Edge' },
+                    @{ Name = 'trailing-comma'; Value = 'Edge,' },
+                    @{ Name = 'leading-colon'; Value = ':Edge' },
+                    @{ Name = 'trailing-colon'; Value = 'Edge:' },
+                    @{ Name = 'leading-semicolon'; Value = ';Edge' },
+                    @{ Name = 'trailing-semicolon'; Value = 'Edge;' },
+                    @{ Name = 'leading-backslash'; Value = '\Edge' },
+                    @{ Name = 'trailing-backslash'; Value = 'Edge\' }
                 )) {
-                    Test-RejectedEdgeWhitespace $kind $field $source $case.Name $case.Value
+                    Test-RejectedGitIdentValue $kind $field $source $case.Name $case.Value
                 }
             }
         }
