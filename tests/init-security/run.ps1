@@ -59,6 +59,10 @@ function Copy-Template([string]$source, [string]$destination) {
 
 function Get-TreeFingerprint([string]$root) {
     $entries = Get-ChildItem -LiteralPath $root -File -Recurse -Force |
+        Where-Object {
+            $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
+            $relative -notmatch '(^|[\\/])\.(git|jj)([\\/]|$)'
+        } |
         Sort-Object FullName |
         ForEach-Object {
             $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
@@ -71,30 +75,36 @@ function Get-InitializerInvocation(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [string]$copyRoot,
     [string]$author,
-    [string]$authorEmail
+    [string]$authorEmail,
+    [switch]$UseDefaultAuthor,
+    [switch]$UseDefaultAuthorEmail
 ) {
     if ($kind -eq 'powershell') {
+        $arguments = @(
+            '-NoProfile', '-File', (Join-Path $copyRoot 'scripts/init.ps1'),
+            '-ProjectName', 'init-security', '-GitHubOwner', 'example',
+            '-Description', 'Initializer security regression fixture',
+            '-Year', '2026', '-KeepScript'
+        )
+        if (-not $UseDefaultAuthor) { $arguments += @('-Author', $author) }
+        if (-not $UseDefaultAuthorEmail) { $arguments += @('-AuthorEmail', $authorEmail) }
         return [pscustomobject]@{
             FileName = $script:PwshPath
-            Arguments = @(
-                '-NoProfile', '-File', (Join-Path $copyRoot 'scripts/init.ps1'),
-                '-ProjectName', 'init-security', '-Author', $author,
-                '-AuthorEmail', $authorEmail, '-GitHubOwner', 'example',
-                '-Description', 'Initializer security regression fixture',
-                '-Year', '2026', '-KeepScript'
-            )
+            Arguments = $arguments
         }
     }
 
+    $arguments = @(
+        (Join-Path $copyRoot 'scripts/init.sh'),
+        '--project-name', 'init-security', '--github-owner', 'example',
+        '--description', 'Initializer security regression fixture',
+        '--year', '2026', '--keep-script'
+    )
+    if (-not $UseDefaultAuthor) { $arguments += @('--author', $author) }
+    if (-not $UseDefaultAuthorEmail) { $arguments += @('--author-email', $authorEmail) }
     [pscustomobject]@{
         FileName = $script:BashPath
-        Arguments = @(
-            (Join-Path $copyRoot 'scripts/init.sh'),
-            '--project-name', 'init-security', '--author', $author,
-            '--author-email', $authorEmail, '--github-owner', 'example',
-            '--description', 'Initializer security regression fixture',
-            '--year', '2026', '--keep-script'
-        )
+        Arguments = $arguments
     }
 }
 
@@ -141,6 +151,70 @@ function Test-RejectedLineBreak(
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $field"
 }
 
+function Test-RejectedAngleBracket(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('author', 'email')][string]$field,
+    [ValidateSet('<', '>')][string]$character
+) {
+    $label = if ($character -eq '<') { 'open' } else { 'close' }
+    $copyRoot = Join-Path $script:TempRoot "$kind-reject-$field-angle-$label"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $author = if ($field -eq 'author') { "Angle ${character}Name" } else { 'Valid Name' }
+    $authorEmail = if ($field -eq 'email') { "angle${character}mail@example.com" } else { 'valid@example.com' }
+    $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted '$character' in $field"
+    }
+    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch "must not contain '<' or '>' because Git strips those characters") {
+        throw "$kind initializer returned an unclear diagnostic for '$character' in $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+    }
+    Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting '$character' in $field"
+}
+
+function Test-RejectedGitConfigLineBreak(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('author', 'email')][string]$field,
+    [string]$caseName,
+    [string]$value
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-reject-config-$field-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+
+    $init = Invoke-CapturedProcess 'git' @('init', '-q') $copyRoot
+    Assert-ProcessSucceeded $init "git init for $kind default-config $field $caseName"
+    foreach ($entry in @(
+        @('user.name', 'Valid Name'),
+        @('user.email', 'valid@example.com')
+    )) {
+        $configured = Invoke-CapturedProcess 'git' @('config', '--local', $entry[0], $entry[1]) $copyRoot
+        Assert-ProcessSucceeded $configured "baseline git config for $kind default-config $field $caseName"
+    }
+    $key = if ($field -eq 'author') { 'user.name' } else { 'user.email' }
+    $configured = Invoke-CapturedProcess 'git' @('config', '--local', $key, $value) $copyRoot
+    Assert-ProcessSucceeded $configured "multiline git config for $kind default-config $field $caseName"
+    $raw = Invoke-CapturedProcess 'git' @('config', '--null', '--get', $key) $copyRoot
+    Assert-ProcessSucceeded $raw "read-back git config for $kind default-config $field $caseName"
+    Assert-Equal $raw.Stdout ($value + "`0") "git did not preserve the $caseName fixture exactly"
+
+    $before = Get-TreeFingerprint $copyRoot
+    $useDefaultAuthor = $field -eq 'author'
+    $useDefaultEmail = $field -eq 'email'
+    $invocation = Get-InitializerInvocation $kind $copyRoot 'Valid Name' 'valid@example.com' `
+        -UseDefaultAuthor:$useDefaultAuthor -UseDefaultAuthorEmail:$useDefaultEmail
+    $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted $caseName in default git-config $field"
+    }
+    if (("$($result.Stdout)`n$($result.Stderr)") -notmatch 'single line; CR and LF characters are not supported') {
+        throw "$kind initializer returned an unclear diagnostic for $caseName in default git-config $field.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+    }
+    Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $caseName in default git-config $field"
+}
+
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $VerifierPath = Join-Path $PSScriptRoot 'verify-generated-workflow.py'
 $PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
@@ -182,6 +256,19 @@ try {
     foreach ($kind in @('powershell', 'posix')) {
         Test-RejectedLineBreak $kind author
         Test-RejectedLineBreak $kind email
+        foreach ($field in @('author', 'email')) {
+            foreach ($character in @('<', '>')) {
+                Test-RejectedAngleBracket $kind $field $character
+            }
+            foreach ($case in @(
+                @{ Name = 'internal-lf'; Value = "Line`nBreak" },
+                @{ Name = 'internal-cr'; Value = "Line`rBreak" },
+                @{ Name = 'trailing-lf'; Value = "LineBreak`n" },
+                @{ Name = 'trailing-cr'; Value = "LineBreak`r" }
+            )) {
+                Test-RejectedGitConfigLineBreak $kind $field $case.Name $case.Value
+            }
+        }
     }
 
     Write-Host 'Initializer release-identity security checks passed.' -ForegroundColor Green

@@ -65,12 +65,19 @@ case "$crate_name" in
 esac
 
 # Defaults (mirror init.ps1).
+read_git_config_value() {
+  # NUL termination lets `read` preserve embedded and trailing line breaks;
+  # ordinary command substitution would strip trailing LF bytes before validation.
+  git_config_value=""
+  IFS= read -r -d '' git_config_value < <(git config --null --get "$1" 2>/dev/null) || return 1
+}
+
 if [ -z "$author" ]; then
-  author="$(git config user.name 2>/dev/null || true)"
+  if read_git_config_value user.name; then author="$git_config_value"; fi
   [ -n "$author" ] || author="Your Name"
 fi
 if [ -z "$author_email" ]; then
-  author_email="$(git config user.email 2>/dev/null || true)"
+  if read_git_config_value user.email; then author_email="$git_config_value"; fi
   [ -n "$author_email" ] || author_email="you@example.com"
 fi
 [ -n "$github_owner" ] || github_owner="your-org"
@@ -81,6 +88,11 @@ validate_release_identity() {
   case "$2" in
     *$'\r'*|*$'\n'*)
       die "invalid $1: release identity values must be a single line; CR and LF characters are not supported."
+      ;;
+  esac
+  case "$2" in
+    *'<'*|*'>'*)
+      die "invalid $1: release identity values must not contain '<' or '>' because Git strips those characters from commit identities."
       ;;
   esac
 }

@@ -80,12 +80,47 @@ if ($crateSafe -notmatch '^[a-z]') {
     throw "Invalid -ProjectName '$ProjectName' -> derived crate name '$crateSafe' starts with a non-letter; cargo requires a crate name that starts with a letter. Pick a project name whose first alphanumeric is a letter (e.g. my-tool)."
 }
 
+function Get-GitConfigValue([string]$key) {
+    # PowerShell's native-output pipeline splits lines into an object array and
+    # string coercion then joins them with spaces. Read NUL-delimited output as
+    # one stream so validation sees the exact configured value instead.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    [void]$startInfo.ArgumentList.Add('config')
+    [void]$startInfo.ArgumentList.Add('--null')
+    [void]$startInfo.ArgumentList.Add('--get')
+    [void]$startInfo.ArgumentList.Add($key)
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            return $null
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $value = $stdout.GetAwaiter().GetResult()
+        [void]$stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0 -or -not $value.EndsWith("`0", [StringComparison]::Ordinal)) {
+            return $null
+        }
+        return $value.Substring(0, $value.Length - 1)
+    } finally {
+        $process.Dispose()
+    }
+}
+
 if (-not $Author) {
-    $Author = (& git config user.name 2>$null)
+    $Author = Get-GitConfigValue 'user.name'
     if (-not $Author) { $Author = 'Your Name' }
 }
 if (-not $AuthorEmail) {
-    $AuthorEmail = (& git config user.email 2>$null)
+    $AuthorEmail = Get-GitConfigValue 'user.email'
     if (-not $AuthorEmail) { $AuthorEmail = 'you@example.com' }
 }
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
@@ -97,6 +132,11 @@ function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
     # template so both initializer paths have the same lossless contract.
     if ($value -match '[\r\n]') {
         throw "Invalid -${parameterName}: release identity values must be a single line; CR and LF characters are not supported."
+    }
+    # Git removes angle brackets while formatting an author ident, so accepting
+    # either character would silently change the public release-commit identity.
+    if ($value -match '[<>]') {
+        throw "Invalid -${parameterName}: release identity values must not contain '<' or '>' because Git strips those characters from commit identities."
     }
 }
 
