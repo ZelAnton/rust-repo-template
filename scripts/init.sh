@@ -77,10 +77,32 @@ fi
 [ -n "$description" ]  || description="TODO: crate description"
 [ -n "$year" ]         || year="$(date +%Y)"
 
+validate_release_identity() {
+  case "$2" in
+    *$'\r'*|*$'\n'*)
+      die "invalid $1: release identity values must be a single line; CR and LF characters are not supported."
+      ;;
+  esac
+}
+
+# Command substitution strips trailing newlines after decoding, and Git
+# identities are single-line values. Reject line breaks before touching the
+# template so both initializer paths have the same lossless contract.
+validate_release_identity "--author" "$author"
+validate_release_identity "--author-email" "$author_email"
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+release_workflow="$repo_root/.github/workflows/release.yml"
+
+# In release.yml the author placeholders are data, not Bash source. Base64 keeps
+# every shell/YAML metacharacter out of the serialized workflow while preserving
+# the exact UTF-8 value for the quoted git-config calls at release time.
+base64_utf8() { printf '%s' "$1" | base64 | tr -d '\r\n'; }
+author_release="$(base64_utf8 "$author")"
+author_email_release="$(base64_utf8 "$author_email")"
 
 # Values written into TOML files (Cargo.toml description/repository) sit inside
 # double-quoted strings — escape backslash then quote so a literal " or \ can't
@@ -138,6 +160,10 @@ while IFS= read -r -d '' file; do
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
+  if [ "$file" = "$release_workflow" ]; then
+    a="$author_release"
+    ae="$author_email_release"
+  fi
   new="$(TPL_SRC="$content" TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
          TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" substitute_tokens; printf x)"
   new="${new%x}"

@@ -327,9 +327,16 @@ jobs:
       - name: Commit version bump + changelog
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          # Initializers serialize these UTF-8 values as Base64, keeping author
+          # input outside both the YAML structure and the Bash program.
+          RELEASE_GIT_AUTHOR_NAME_B64: "__Author__"
+          RELEASE_GIT_AUTHOR_EMAIL_B64: "__AuthorEmail__"
         run: |
-          git config user.name  "__Author__"
-          git config user.email "__AuthorEmail__"
+          set -euo pipefail
+          release_git_author_name="$(printf '%s' "${RELEASE_GIT_AUTHOR_NAME_B64}" | base64 --decode)"
+          release_git_author_email="$(printf '%s' "${RELEASE_GIT_AUTHOR_EMAIL_B64}" | base64 --decode)"
+          git config user.name "$release_git_author_name"
+          git config user.email "$release_git_author_email"
           # Stage exactly the release artifacts. (release-notes.md lives in
           # $RUNNER_TEMP, outside the tree, so it is never a candidate here.)
           git add Cargo.toml Cargo.lock CHANGELOG.md

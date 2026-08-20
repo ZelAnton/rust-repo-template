@@ -36,6 +36,12 @@ jobs:
       - name: Lint YAML
         run: yamllint .
 
+      # yamllint installs PyYAML, which the regression harness also uses to
+      # validate each generated release workflow before exercising its commit step.
+      - name: Test initializer release identity safety
+        shell: pwsh
+        run: ./tests/init-security/run.ps1
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

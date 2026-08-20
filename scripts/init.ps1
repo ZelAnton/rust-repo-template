@@ -91,6 +91,18 @@ if (-not $AuthorEmail) {
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: crate description' }
 
+function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
+    # Command substitution strips trailing newlines after decoding, and Git
+    # identities are single-line values. Reject line breaks before touching the
+    # template so both initializer paths have the same lossless contract.
+    if ($value -match '[\r\n]') {
+        throw "Invalid -${parameterName}: release identity values must be a single line; CR and LF characters are not supported."
+    }
+}
+
+Assert-ReleaseIdentityValue -parameterName 'Author' -value $Author
+Assert-ReleaseIdentityValue -parameterName 'AuthorEmail' -value $AuthorEmail
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
@@ -102,6 +114,23 @@ $replacements = [ordered]@{
     '__Description__'  = $Description
     '__Year__'        = "$Year"
 }
+
+# In release.yml the author placeholders are data, not Bash source. Base64 keeps
+# every shell/YAML metacharacter out of the serialized workflow while preserving
+# the exact UTF-8 value for the quoted git-config calls at release time.
+$releaseWorkflowReplacements = [ordered]@{}
+foreach ($key in $replacements.Keys) {
+    $releaseWorkflowReplacements[$key] = $replacements[$key]
+}
+$releaseWorkflowReplacements['__Author__'] = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($Author)
+)
+$releaseWorkflowReplacements['__AuthorEmail__'] = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($AuthorEmail)
+)
+$releaseWorkflowPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot '.github/workflows/release.yml')
+)
 
 # Values written into TOML files (Cargo.toml description/repository) sit inside
 # double-quoted strings — a literal " or \ in an author/description would break
@@ -135,7 +164,13 @@ $contentChanged = 0
 foreach ($file in $files) {
     $text = [System.IO.File]::ReadAllText($file.FullName)
     $new = $text
-    $map = if ($tomlFileExtensions -contains $file.Extension) { $tomlReplacements } else { $replacements }
+    $map = if ([IO.Path]::GetFullPath($file.FullName) -eq $releaseWorkflowPath) {
+        $releaseWorkflowReplacements
+    } elseif ($tomlFileExtensions -contains $file.Extension) {
+        $tomlReplacements
+    } else {
+        $replacements
+    }
     foreach ($key in $map.Keys) {
         $new = $new.Replace($key, $map[$key])
     }
