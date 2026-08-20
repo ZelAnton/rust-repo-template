@@ -80,16 +80,106 @@ if ($crateSafe -notmatch '^[a-z]') {
     throw "Invalid -ProjectName '$ProjectName' -> derived crate name '$crateSafe' starts with a non-letter; cargo requires a crate name that starts with a letter. Pick a project name whose first alphanumeric is a letter (e.g. my-tool)."
 }
 
+function Get-GitConfigValue([string]$key) {
+    # PowerShell's native-output pipeline splits lines into an object array and
+    # string coercion then joins them with spaces. Read NUL-delimited output as
+    # one stream so validation sees the exact configured value instead.
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    [void]$startInfo.ArgumentList.Add('config')
+    [void]$startInfo.ArgumentList.Add('--null')
+    [void]$startInfo.ArgumentList.Add('--get')
+    [void]$startInfo.ArgumentList.Add($key)
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            return $null
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $value = $stdout.GetAwaiter().GetResult()
+        [void]$stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0 -or -not $value.EndsWith("`0", [StringComparison]::Ordinal)) {
+            return $null
+        }
+        return $value.Substring(0, $value.Length - 1)
+    } finally {
+        $process.Dispose()
+    }
+}
+
 if (-not $Author) {
-    $Author = (& git config user.name 2>$null)
+    $Author = Get-GitConfigValue 'user.name'
     if (-not $Author) { $Author = 'Your Name' }
 }
 if (-not $AuthorEmail) {
-    $AuthorEmail = (& git config user.email 2>$null)
+    $AuthorEmail = Get-GitConfigValue 'user.email'
     if (-not $AuthorEmail) { $AuthorEmail = 'you@example.com' }
 }
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: crate description' }
+
+function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
+    # Command substitution strips trailing newlines after decoding, and Git
+    # identities are single-line values. Reject line breaks before touching the
+    # template so both initializer paths have the same lossless contract.
+    if ($value -match '[\r\n]') {
+        throw "Invalid -${parameterName}: release identity values must be a single line; CR and LF characters are not supported."
+    }
+
+    # Git's ident formatter strips a wider set of boundary punctuation than its
+    # config store does. Probe the formatter itself so accepted values have a
+    # lossless contract even if that set changes, instead of maintaining a
+    # second, inevitably incomplete blacklist in this initializer.
+    $probeName = if ($parameterName -eq 'Author') { $value } else { 'Release Identity Probe' }
+    $probeEmail = if ($parameterName -eq 'AuthorEmail') { $value } else { 'probe@example.invalid' }
+    $expected = "$probeName <$probeEmail> 0 +0000"
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [Text.UTF8Encoding]::new($false, $true)
+    $startInfo.Environment['GIT_AUTHOR_NAME'] = $probeName
+    $startInfo.Environment['GIT_AUTHOR_EMAIL'] = $probeEmail
+    $startInfo.Environment['GIT_AUTHOR_DATE'] = '@0 +0000'
+    [void]$startInfo.ArgumentList.Add('var')
+    [void]$startInfo.ArgumentList.Add('GIT_AUTHOR_IDENT')
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "Invalid -${parameterName}: Git could not validate the release identity value."
+        }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $rendered = $stdout.GetAwaiter().GetResult()
+        [void]$stderr.GetAwaiter().GetResult()
+        if ($rendered.EndsWith("`r`n", [StringComparison]::Ordinal)) {
+            $rendered = $rendered.Substring(0, $rendered.Length - 2)
+        } elseif ($rendered.EndsWith("`n", [StringComparison]::Ordinal)) {
+            $rendered = $rendered.Substring(0, $rendered.Length - 1)
+        }
+        if ($process.ExitCode -ne 0 -or $rendered -cne $expected) {
+            throw "Invalid -${parameterName}: release identity value is not preserved exactly when Git formats a commit identity; Git would strip or alter characters."
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
+Assert-ReleaseIdentityValue -parameterName 'Author' -value $Author
+Assert-ReleaseIdentityValue -parameterName 'AuthorEmail' -value $AuthorEmail
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
@@ -102,6 +192,23 @@ $replacements = [ordered]@{
     '__Description__'  = $Description
     '__Year__'        = "$Year"
 }
+
+# In release.yml the author placeholders are data, not Bash source. Base64 keeps
+# every shell/YAML metacharacter out of the serialized workflow while preserving
+# the exact UTF-8 value for the quoted git-config calls at release time.
+$releaseWorkflowReplacements = [ordered]@{}
+foreach ($key in $replacements.Keys) {
+    $releaseWorkflowReplacements[$key] = $replacements[$key]
+}
+$releaseWorkflowReplacements['__Author__'] = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($Author)
+)
+$releaseWorkflowReplacements['__AuthorEmail__'] = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($AuthorEmail)
+)
+$releaseWorkflowPath = [IO.Path]::GetFullPath(
+    (Join-Path $repoRoot '.github/workflows/release.yml')
+)
 
 # Values written into TOML files (Cargo.toml description/repository) sit inside
 # double-quoted strings — a literal " or \ in an author/description would break
@@ -135,7 +242,13 @@ $contentChanged = 0
 foreach ($file in $files) {
     $text = [System.IO.File]::ReadAllText($file.FullName)
     $new = $text
-    $map = if ($tomlFileExtensions -contains $file.Extension) { $tomlReplacements } else { $replacements }
+    $map = if ([IO.Path]::GetFullPath($file.FullName) -eq $releaseWorkflowPath) {
+        $releaseWorkflowReplacements
+    } elseif ($tomlFileExtensions -contains $file.Extension) {
+        $tomlReplacements
+    } else {
+        $replacements
+    }
     foreach ($key in $map.Keys) {
         $new = $new.Replace($key, $map[$key])
     }

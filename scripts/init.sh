@@ -65,22 +65,72 @@ case "$crate_name" in
 esac
 
 # Defaults (mirror init.ps1).
+read_git_config_value() {
+  # NUL termination lets `read` preserve embedded and trailing line breaks;
+  # ordinary command substitution would strip trailing LF bytes before validation.
+  git_config_value=""
+  IFS= read -r -d '' git_config_value < <(git config --null --get "$1" 2>/dev/null) || return 1
+}
+
 if [ -z "$author" ]; then
-  author="$(git config user.name 2>/dev/null || true)"
+  if read_git_config_value user.name; then author="$git_config_value"; fi
   [ -n "$author" ] || author="Your Name"
 fi
 if [ -z "$author_email" ]; then
-  author_email="$(git config user.email 2>/dev/null || true)"
+  if read_git_config_value user.email; then author_email="$git_config_value"; fi
   [ -n "$author_email" ] || author_email="you@example.com"
 fi
 [ -n "$github_owner" ] || github_owner="your-org"
 [ -n "$description" ]  || description="TODO: crate description"
 [ -n "$year" ]         || year="$(date +%Y)"
 
+validate_release_identity() {
+  case "$2" in
+    *$'\r'*|*$'\n'*)
+      die "invalid $1: release identity values must be a single line; CR and LF characters are not supported."
+      ;;
+  esac
+
+  # Ask Git's ident formatter to round-trip each value against a fixed safe
+  # counterpart. Git strips more boundary punctuation than its config store;
+  # probing the formatter keeps this contract complete without duplicating its
+  # evolving internal blacklist here.
+  if [ "$1" = "--author" ]; then
+    probe_name="$2"
+    probe_email="probe@example.invalid"
+  else
+    probe_name="Release Identity Probe"
+    probe_email="$2"
+  fi
+  expected_ident="$probe_name <$probe_email> 0 +0000"
+  rendered_ident="$(
+    GIT_AUTHOR_NAME="$probe_name" \
+    GIT_AUTHOR_EMAIL="$probe_email" \
+    GIT_AUTHOR_DATE='@0 +0000' \
+      git var GIT_AUTHOR_IDENT 2>/dev/null
+  )" || die "invalid $1: Git could not validate the release identity value."
+  [ "$rendered_ident" = "$expected_ident" ] ||
+    die "invalid $1: release identity value is not preserved exactly when Git formats a commit identity; Git would strip or alter characters."
+}
+
+# Command substitution strips trailing newlines after decoding, and Git
+# identities are single-line values. Reject line breaks before touching the
+# template so both initializer paths have the same lossless contract.
+validate_release_identity "--author" "$author"
+validate_release_identity "--author-email" "$author_email"
+
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 self="$script_dir/$(basename "$0")"
 sibling_ps1="$script_dir/init.ps1"
+release_workflow="$repo_root/.github/workflows/release.yml"
+
+# In release.yml the author placeholders are data, not Bash source. Base64 keeps
+# every shell/YAML metacharacter out of the serialized workflow while preserving
+# the exact UTF-8 value for the quoted git-config calls at release time.
+base64_utf8() { printf '%s' "$1" | base64 | tr -d '\r\n'; }
+author_release="$(base64_utf8 "$author")"
+author_email_release="$(base64_utf8 "$author_email")"
 
 # Values written into TOML files (Cargo.toml description/repository) sit inside
 # double-quoted strings — escape backslash then quote so a literal " or \ can't
@@ -138,6 +188,10 @@ while IFS= read -r -d '' file; do
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
   content="$(cat "$file"; printf x)"; content="${content%x}"
+  if [ "$file" = "$release_workflow" ]; then
+    a="$author_release"
+    ae="$author_email_release"
+  fi
   new="$(TPL_SRC="$content" TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
          TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" substitute_tokens; printf x)"
   new="${new%x}"
