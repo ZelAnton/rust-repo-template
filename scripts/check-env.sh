@@ -4,11 +4,10 @@
 # the template (POSIX counterpart of check-env.ps1 — use whichever matches your
 # shell; both do the same thing).
 #
-# Verifies the Rust toolchain (cargo + rustc) is on PATH. rust-toolchain.toml
+# Verifies cargo and rustc can each report a usable version. rust-toolchain.toml
 # pins the channel and components (rustfmt, clippy), which rustup installs
-# automatically on the first build, so only cargo/rustc need to be present.
-# Exits 0 when ready; if the toolchain is missing it prints per-OS install
-# commands and exits 1 — install it, then re-run.
+# automatically on the first build. Exits 0 only after both checks succeed;
+# otherwise it reports every failed check and exits 1.
 #
 # Usage: bash ./scripts/check-env.sh
 
@@ -18,12 +17,31 @@ case "${1:-}" in -h|--help) sed -n '2,13p' "$0"; exit 0 ;; esac
 problems=()
 echo "==> Checking environment for Rust development"
 
-# Required: cargo (build/test driver) and rustc (the compiler).
-command -v cargo >/dev/null 2>&1 || problems+=("cargo ('cargo' is not on PATH)")
-command -v rustc >/dev/null 2>&1 || problems+=("the Rust compiler ('rustc' is not on PATH)")
-if [ ${#problems[@]} -eq 0 ]; then
-  echo "    $(rustc --version)"
-fi
+# Required: cargo (build/test driver) and rustc (the compiler). Resolve the
+# executable path so a same-named shell function cannot stand in for the tool.
+for tool in cargo rustc; do
+  if ! tool_path=$(type -P "$tool"); then
+    problems+=("$tool ('$tool' is not on PATH)")
+    continue
+  fi
+
+  status=0
+  if version_output=$("$tool_path" --version 2>/dev/null); then
+    :
+  else
+    status=$?
+  fi
+
+  if [ "$status" -ne 0 ]; then
+    problems+=("$tool ('$tool --version' exited with code $status)")
+  elif [ -z "${version_output//[[:space:]]/}" ]; then
+    problems+=("$tool ('$tool --version' returned empty output)")
+  elif [[ ! "$version_output" =~ ^[[:space:]]*${tool}[[:space:]]+[^[:space:]]+ ]]; then
+    problems+=("$tool ('$tool --version' returned unusable output)")
+  else
+    echo "    $version_output"
+  fi
+done
 
 if [ ${#problems[@]} -eq 0 ]; then
   echo
@@ -33,7 +51,7 @@ if [ ${#problems[@]} -eq 0 ]; then
 fi
 
 echo
-echo "Environment NOT ready. Missing:"
+echo "Environment NOT ready. Problems:"
 for p in "${problems[@]}"; do echo "  - $p"; done
 echo
 echo "Install the Rust toolchain via rustup, then re-run this check:"
