@@ -207,6 +207,17 @@ wrong or obsolete.
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
 
+### 2026-08-21 — initializer security races timed out before semantic readiness
+- **Symptom:** The full security harness repeatedly failed while waiting for
+  `INITIALIZER_TEST_PREFLIGHT_READY`, although the initializer process was still
+  alive and later focused checks passed.
+- **Root cause:** The harness allowed only 30 seconds for a complete template
+  inventory and hash preflight; loaded Windows filesystems can exceed that
+  budget without being hung.
+- **Rule:** Keep race injection gated on the ready-file signal, but give the
+  preflight a bounded two-minute budget. Never replace semantic readiness with a
+  fixed sleep.
+
 ### 2026-08-21 — initializer collisions could overwrite or partially mutate a checkout
 - **Symptom:** A token-named file could replace an existing file on POSIX, a
   token-named directory could be moved *inside* an existing directory, and an

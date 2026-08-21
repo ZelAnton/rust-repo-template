@@ -5,7 +5,9 @@ param(
     [switch]$RaceOnly,
     [switch]$ReopenedOnly,
     [switch]$ContentSafetyOnly,
-    [switch]$GitFileOnly
+    [switch]$GitFileOnly,
+    [switch]$NoGitOnly,
+    [switch]$ReleaseIdentityOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -146,7 +148,10 @@ function Invoke-CapturedProcessAtCheckpoint(
 
     $stdout = $process.StandardOutput.ReadToEndAsync()
     $stderr = $process.StandardError.ReadToEndAsync()
-    $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    # The initializer inventories and hashes a full template copy before this
+    # semantic ready signal. Loaded Windows filesystems can exceed 30 seconds;
+    # keep the wait bounded without substituting elapsed time for readiness.
+    $checkpointDeadline = [DateTime]::UtcNow.AddMinutes(2)
     while (-not (Test-Path -LiteralPath $readyFile) -and -not $process.HasExited) {
         if ([DateTime]::UtcNow -ge $checkpointDeadline) {
             $process.Kill($true)
@@ -578,6 +583,58 @@ function Test-SuccessfulInitialization(
     Assert-ProcessSucceeded $verification "$kind generated workflow verification ($source $caseName)"
 
     [IO.File]::ReadAllText((Join-Path $copyRoot '.github/workflows/release.yml'))
+}
+
+function Test-PowerShellInitializationWithoutGit(
+    [ValidateSet('defaults', 'explicit')][string]$source
+) {
+    $copyRoot = Join-Path $script:TempRoot "powershell-no-git-$source"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $isolatedPath = Join-Path $script:TempRoot "empty-path-$source"
+    [void](New-Item -ItemType Directory -Path $isolatedPath)
+    $environment = @{ PATH = $isolatedPath }
+
+    $probe = @'
+$command = Get-Command git -CommandType Application -ErrorAction SilentlyContinue
+if ($command) { exit 1 }
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = 'git'
+$startInfo.UseShellExecute = $false
+$process = [Diagnostics.Process]::new()
+$process.StartInfo = $startInfo
+try {
+    if ($process.Start()) {
+        $process.Kill($true)
+        exit 1
+    }
+    exit 0
+} catch [ComponentModel.Win32Exception] {
+    exit 0
+} finally {
+    $process.Dispose()
+}
+exit 1
+'@
+    $unavailable = Invoke-CapturedProcess `
+        $script:PwshPath @('-NoProfile', '-Command', $probe) $copyRoot $environment
+    Assert-ProcessSucceeded $unavailable "PowerShell no-Git environment probe ($source)"
+
+    $expectedAuthor = if ($source -eq 'defaults') { 'Your Name' } else { 'Explicit Author' }
+    $expectedEmail = if ($source -eq 'defaults') { 'you@example.com' } else { 'explicit@example.com' }
+    $useDefaults = $source -eq 'defaults'
+    $invocation = Get-InitializerInvocation powershell $copyRoot $expectedAuthor $expectedEmail `
+        -UseDefaultAuthor:$useDefaults -UseDefaultAuthorEmail:$useDefaults
+    $invocation.Environment = $environment
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "PowerShell initializer without Git ($source)"
+    Assert-TemplateOnlySecurityArtifactsRemoved $copyRoot "PowerShell initializer without Git ($source)"
+
+    $verification = Invoke-CapturedProcess $script:PythonPath @(
+        $script:VerifierPath, '--repo', $copyRoot, '--bash', $script:BashPath,
+        '--expected-name', $expectedAuthor, '--expected-email', $expectedEmail
+    ) $copyRoot
+    Assert-ProcessSucceeded $verification "PowerShell no-Git workflow verification ($source)"
 }
 
 function Test-SafeContentSuccess(
@@ -1531,6 +1588,14 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    if ($NoGitOnly) {
+        foreach ($source in @('defaults', 'explicit')) {
+            Test-PowerShellInitializationWithoutGit $source
+        }
+        Write-Host 'PowerShell initializer no-Git fallback checks passed.' -ForegroundColor Green
+        return
+    }
+
     if ($GitFileOnly) {
         foreach ($kind in @('powershell', 'posix')) {
             Test-GitFileExclusion $kind
@@ -1539,6 +1604,7 @@ try {
         return
     }
 
+    if (-not $ReleaseIdentityOnly) {
     $psContent = Test-SafeContentSuccess powershell
     $shContent = Test-SafeContentSuccess posix
     Assert-Equal $shContent $psContent 'Initializers produced different safe-content bytes'
@@ -1608,8 +1674,13 @@ try {
     if ($CollisionOnly) {
         return
     }
+    }
 
     Test-DiagnosticNormalization
+
+    foreach ($source in @('defaults', 'explicit')) {
+        Test-PowerShellInitializationWithoutGit $source
+    }
 
     $ordinaryAuthor = 'Renée  O''Connor, "R&D" + QA'
     $ordinaryEmail = 'anne.o+release@example.com'
