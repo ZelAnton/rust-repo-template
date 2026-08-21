@@ -81,12 +81,19 @@ if ($crateSafe -notmatch '^[a-z]') {
     throw "Invalid -ProjectName '$ProjectName' -> derived crate name '$crateSafe' starts with a non-letter; cargo requires a crate name that starts with a letter. Pick a project name whose first alphanumeric is a letter (e.g. my-tool)."
 }
 
-function Get-GitConfigValue([string]$key) {
+$gitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue
+$gitPath = if ($gitCommand) { $gitCommand.Source } else { $null }
+
+function Get-GitConfigValue([string]$key, [string]$executablePath) {
+    if (-not $executablePath) {
+        return $null
+    }
+
     # PowerShell's native-output pipeline splits lines into an object array and
     # string coercion then joins them with spaces. Read NUL-delimited output as
     # one stream so validation sees the exact configured value instead.
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = 'git'
+    $startInfo.FileName = $executablePath
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
@@ -99,7 +106,12 @@ function Get-GitConfigValue([string]$key) {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {
-        if (-not $process.Start()) {
+        try {
+            $started = $process.Start()
+        } catch [ComponentModel.Win32Exception] {
+            return $null
+        }
+        if (-not $started) {
             return $null
         }
         $stdout = $process.StandardOutput.ReadToEndAsync()
@@ -117,22 +129,49 @@ function Get-GitConfigValue([string]$key) {
 }
 
 if (-not $Author) {
-    $Author = Get-GitConfigValue 'user.name'
+    $Author = Get-GitConfigValue 'user.name' $gitPath
     if (-not $Author) { $Author = 'Your Name' }
 }
 if (-not $AuthorEmail) {
-    $AuthorEmail = Get-GitConfigValue 'user.email'
+    $AuthorEmail = Get-GitConfigValue 'user.email' $gitPath
     if (-not $AuthorEmail) { $AuthorEmail = 'you@example.com' }
 }
 if (-not $GitHubOwner) { $GitHubOwner = 'your-org' }
 if (-not $Description) { $Description = 'TODO: crate description' }
 
-function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
+function Test-ReleaseIdentityFallback([string]$value) {
+    # Git removes angle brackets wherever they occur and trims this ASCII set
+    # from identity boundaries. Keep the no-Git path aligned with that contract;
+    # when Git is available, its formatter below remains the final authority.
+    if ($value.Length -eq 0 -or $value.IndexOfAny([char[]]@([char]0, '<', '>')) -ge 0) {
+        return $false
+    }
+    $boundaryCrud = [char[]]@(
+        [char]0x20, [char]0x09, [char]0x0b, [char]0x0c,
+        ',', ':', ';', '"', "'", '\'
+    )
+    return (
+        [Array]::IndexOf($boundaryCrud, $value[0]) -lt 0 -and
+        [Array]::IndexOf($boundaryCrud, $value[$value.Length - 1]) -lt 0
+    )
+}
+
+function Assert-ReleaseIdentityValue(
+    [string]$parameterName,
+    [string]$value,
+    [string]$executablePath
+) {
     # Command substitution strips trailing newlines after decoding, and Git
     # identities are single-line values. Reject line breaks before touching the
     # template so both initializer paths have the same lossless contract.
     if ($value -match '[\r\n]') {
         throw "Invalid -${parameterName}: release identity values must be a single line; CR and LF characters are not supported."
+    }
+    if (-not (Test-ReleaseIdentityFallback $value)) {
+        throw "Invalid -${parameterName}: release identity value is not preserved exactly when Git formats a commit identity; Git would strip or alter characters."
+    }
+    if (-not $executablePath) {
+        return
     }
 
     # Git's ident formatter strips a wider set of boundary punctuation than its
@@ -144,7 +183,7 @@ function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
     $expected = "$probeName <$probeEmail> 0 +0000"
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = 'git'
+    $startInfo.FileName = $executablePath
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
@@ -158,8 +197,13 @@ function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
     try {
-        if (-not $process.Start()) {
-            throw "Invalid -${parameterName}: Git could not validate the release identity value."
+        try {
+            $started = $process.Start()
+        } catch [ComponentModel.Win32Exception] {
+            return
+        }
+        if (-not $started) {
+            return
         }
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
@@ -179,8 +223,8 @@ function Assert-ReleaseIdentityValue([string]$parameterName, [string]$value) {
     }
 }
 
-Assert-ReleaseIdentityValue -parameterName 'Author' -value $Author
-Assert-ReleaseIdentityValue -parameterName 'AuthorEmail' -value $AuthorEmail
+Assert-ReleaseIdentityValue -parameterName 'Author' -value $Author -executablePath $gitPath
+Assert-ReleaseIdentityValue -parameterName 'AuthorEmail' -value $AuthorEmail -executablePath $gitPath
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
