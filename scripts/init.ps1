@@ -263,6 +263,69 @@ function Get-RelativeDisplayPath([string]$path) {
     [IO.Path]::GetRelativePath($repoRoot, [IO.Path]::GetFullPath($path)).Replace('\', '/')
 }
 
+# Directory.CreateDirectory treats an existing directory as success. The native
+# primitives preserve mkdir's exclusive-create result, which is what lets the
+# filesystem decide case, Unicode, normalization, and per-directory aliases
+# without first touching a directory that belongs to somebody else.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace RustTemplateInit {
+    public static class NativeDirectory {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateDirectoryW")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateDirectoryWindows(string path, IntPtr securityAttributes);
+
+        [DllImport("libc", CharSet = CharSet.Ansi, SetLastError = true, EntryPoint = "mkdir")]
+        private static extern int CreateDirectoryUnix(string path, uint mode);
+
+        public static bool TryCreate(string path, out int error) {
+            bool created;
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+                string nativePath = path.StartsWith(@"\\?\", StringComparison.Ordinal)
+                    ? path
+                    : path.StartsWith(@"\\", StringComparison.Ordinal)
+                        ? @"\\?\UNC\" + path.Substring(2)
+                        : @"\\?\" + path;
+                created = CreateDirectoryWindows(nativePath, IntPtr.Zero);
+            } else {
+                created = CreateDirectoryUnix(path, 511) == 0; // 0777, restricted by the caller's umask.
+            }
+            error = created ? 0 : Marshal.GetLastWin32Error();
+            return created;
+        }
+    }
+}
+'@
+
+function New-ExclusiveDirectory([string]$path, [ref]$nativeError) {
+    [RustTemplateInit.NativeDirectory]::TryCreate($path, $nativeError)
+}
+
+function Wait-ReservationCleanupCheckpoint([string]$relativeDestination) {
+    if (
+        $env:INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK -cne
+            $relativeDestination
+    ) {
+        return
+    }
+
+    [Console]::Out.WriteLine('INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED')
+    if ($env:INIT_SECURITY_TEST_READY_FILE -and $env:INIT_SECURITY_TEST_RELEASE_FILE) {
+        [IO.File]::WriteAllText($env:INIT_SECURITY_TEST_READY_FILE, 'ready')
+        $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $env:INIT_SECURITY_TEST_RELEASE_FILE)) {
+            if ([DateTime]::UtcNow -ge $checkpointDeadline) {
+                throw 'Initializer reservation cleanup checkpoint was not released.'
+            }
+            Start-Sleep -Milliseconds 20
+        }
+    } elseif ([Console]::In.ReadLine() -cne 'continue') {
+        throw 'Initializer reservation cleanup checkpoint was not released.'
+    }
+}
+
 Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
 
 # Build every mutation plan before the first write. In particular, a path
@@ -305,72 +368,75 @@ if ($activateClaudeSettings -and -not (Test-Path -LiteralPath $claudeTemplate -P
 
 $collisions = [Collections.Generic.List[string]]::new()
 $reservations = [Collections.Generic.List[object]]::new()
-$reservationOwners = [Collections.Generic.Dictionary[string, object]]::new(
-    [StringComparer]::Ordinal
-)
 
 function Add-DestinationReservation(
     [string]$destination,
     [string]$relativeDestination,
     [string]$relativeSource
 ) {
-    # Create the exact absent destination in its real parent. CreateNew asks the
-    # filesystem itself about case/Unicode equivalence, including per-directory
-    # behavior that a root probe or string fold cannot model.
-    $marker = "rust-template-init-reservation:$([guid]::NewGuid().ToString('N'))"
-    $stream = $null
-    try {
-        $stream = [IO.File]::Open(
-            $destination,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::Read
-        )
-        $bytes = [Text.Encoding]::UTF8.GetBytes($marker)
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush($true)
-        $stream.Dispose()
-        $stream = $null
+    # Reserve the exact absent target with an exclusive mkdir in its real
+    # parent. Record ownership before creating the nested nonce so a partial
+    # marker failure cannot strand an untracked filesystem entry.
+    $nativeError = 0
+    if (New-ExclusiveDirectory $destination ([ref]$nativeError)) {
+        $markerName = ".rust-template-init-reservation-$([guid]::NewGuid().ToString('N'))"
         $reservation = [pscustomobject]@{
             Destination = $destination
             RelativeDestination = $relativeDestination
             RelativeSource = $relativeSource
-            Marker = $marker
+            MarkerPath = Join-Path $destination $markerName
+            MarkerName = $markerName
+            MarkerCreated = $false
         }
+        # This append must remain immediately after the successful outer mkdir.
         $reservations.Add($reservation)
-        $reservationOwners[$marker] = $reservation
-        return
-    } catch {
-        if ($null -ne $stream) {
-            $stream.Dispose()
-            $stream = $null
-            try { [IO.File]::Delete($destination) } catch { }
-            throw "Could not write destination reservation '$relativeDestination'; no files were changed."
+
+        if ($env:INIT_SECURITY_TEST_FAIL_RESERVATION_MARKER -ceq $relativeDestination) {
+            $collisions.Add(
+                "destination '$relativeDestination' ownership marker could not be created after reservation; no files were changed (source '$relativeSource')"
+            )
+            return
         }
 
-        $owner = $null
+        $markerError = 0
+        if (-not (New-ExclusiveDirectory $reservation.MarkerPath ([ref]$markerError))) {
+            $collisions.Add(
+                "destination '$relativeDestination' ownership marker could not be created after reservation; filesystem error $markerError (source '$relativeSource')"
+            )
+            return
+        }
+        $reservation.MarkerCreated = $true
+        return
+    }
+
+    $owner = $null
+    foreach ($reservation in $reservations) {
+        if (-not $reservation.MarkerCreated) {
+            continue
+        }
+        $candidateMarker = Join-Path $destination $reservation.MarkerName
         try {
-            $item = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+            $item = Get-Item -LiteralPath $candidateMarker -Force -ErrorAction Stop
             if (
-                -not $item.PSIsContainer -and
+                $item.PSIsContainer -and
                 -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
             ) {
-                $existingMarker = [IO.File]::ReadAllText($destination, [Text.Encoding]::UTF8)
-                [void]$reservationOwners.TryGetValue($existingMarker, [ref]$owner)
+                $owner = $reservation
+                break
             }
         } catch { }
+    }
 
-        if ($null -ne $owner) {
-            $collisions.Add(
-                "destination '$relativeDestination' is planned by multiple sources: '$($owner.RelativeSource)', '$relativeSource'"
-            )
-        } elseif (Test-PathEntryExists $destination) {
-            $collisions.Add("destination '$relativeDestination' already exists (source '$relativeSource')")
-        } else {
-            $collisions.Add(
-                "destination '$relativeDestination' could not be reserved; filesystem equivalence could not be established (source '$relativeSource')"
-            )
-        }
+    if ($null -ne $owner) {
+        $collisions.Add(
+            "destination '$relativeDestination' is planned by multiple sources: '$($owner.RelativeSource)', '$relativeSource'"
+        )
+    } elseif (Test-PathEntryExists $destination) {
+        $collisions.Add("destination '$relativeDestination' already exists (source '$relativeSource')")
+    } else {
+        $collisions.Add(
+            "destination '$relativeDestination' could not be reserved; filesystem equivalence could not be established (native error $nativeError; source '$relativeSource')"
+        )
     }
 }
 
@@ -387,21 +453,28 @@ if ($activateClaudeSettings) {
         (Get-RelativeDisplayPath $claudeTemplate)
 }
 
-# Reservation cleanup is part of preflight, not the mutation transaction. Only
-# an ordinary file carrying our unguessable marker is removed; any mismatch is
-# left untouched and makes initialization fail closed before template writes.
+# Reservation cleanup is part of preflight, not the mutation transaction. Both
+# removals are non-recursive: a replacement file, reparse point, or non-empty
+# directory survives and makes initialization fail closed before template writes.
 $reservationCleanupErrors = [Collections.Generic.List[string]]::new()
 foreach ($reservation in $reservations) {
     try {
-        $item = Get-Item -LiteralPath $reservation.Destination -Force -ErrorAction Stop
-        if (
-            $item.PSIsContainer -or
-            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
-            [IO.File]::ReadAllText($reservation.Destination, [Text.Encoding]::UTF8) -cne $reservation.Marker
-        ) {
-            throw 'reservation identity changed before cleanup'
+        if ($reservation.MarkerCreated) {
+            $markerItem = Get-Item -LiteralPath $reservation.MarkerPath -Force -ErrorAction Stop
+            if (
+                -not $markerItem.PSIsContainer -or
+                ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            ) {
+                throw 'reservation ownership marker changed before cleanup'
+            }
+            Wait-ReservationCleanupCheckpoint $reservation.RelativeDestination
+            [IO.Directory]::Delete($reservation.MarkerPath, $false)
+            if (Test-PathEntryExists $reservation.MarkerPath) {
+                throw 'reservation ownership marker still exists after cleanup'
+            }
         }
-        [IO.File]::Delete($reservation.Destination)
+
+        [IO.Directory]::Delete($reservation.Destination, $false)
         if (Test-PathEntryExists $reservation.Destination) {
             throw 'destination still exists after reservation cleanup'
         }

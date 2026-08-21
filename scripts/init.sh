@@ -344,39 +344,55 @@ collision_count=0
 reservation_paths=()
 reservation_relatives=()
 reservation_sources=()
-reservation_markers=()
+reservation_marker_names=()
+reservation_marker_paths=()
+reservation_marker_created=()
 reservation_count=0
 
 reserve_destination() {
   reservation_path="$1"
   reservation_relative="$2"
   reservation_source="$3"
-  reservation_marker="rust-template-init-reservation:${transaction_dir##*/}:$$:$reservation_count"
+  reservation_marker_name=".rust-template-init-reservation-${transaction_dir##*/}-$$-$reservation_count"
 
-  # Noclobber creation at the exact absent target delegates case, Unicode
-  # normalization, and per-directory equivalence to the filesystem that owns
-  # this destination. A repo-root probe and ASCII folding cannot do that.
-  if (set -o noclobber; printf '%s' "$reservation_marker" > "$reservation_path") 2>/dev/null; then
-    reservation_paths[reservation_count]="$reservation_path"
-    reservation_relatives[reservation_count]="$reservation_relative"
-    reservation_sources[reservation_count]="$reservation_source"
-    reservation_markers[reservation_count]="$reservation_marker"
+  # Exclusive mkdir at the exact target delegates case, Unicode, normalization,
+  # and per-directory equivalence to its filesystem. Track the outer directory
+  # before attempting the nested nonce so partial marker failure stays cleanable.
+  if mkdir "$reservation_path" 2>/dev/null; then
+    reservation_i="$reservation_count"
+    reservation_paths[reservation_i]="$reservation_path"
+    reservation_relatives[reservation_i]="$reservation_relative"
+    reservation_sources[reservation_i]="$reservation_source"
+    reservation_marker_names[reservation_i]="$reservation_marker_name"
+    reservation_marker_paths[reservation_i]="$reservation_path/$reservation_marker_name"
+    reservation_marker_created[reservation_i]=0
+    # This increment must remain immediately after the successful outer mkdir.
     reservation_count=$((reservation_count + 1))
+
+    if [ "${INIT_SECURITY_TEST_FAIL_RESERVATION_MARKER:-}" = "$reservation_relative" ]; then
+      collision_messages+=("destination '$reservation_relative' ownership marker could not be created after reservation; no files were changed (source '$reservation_source')")
+      collision_count=$((collision_count + 1))
+      return
+    fi
+
+    if ! mkdir "${reservation_marker_paths[reservation_i]}" 2>/dev/null; then
+      collision_messages+=("destination '$reservation_relative' ownership marker could not be created after reservation (source '$reservation_source')")
+      collision_count=$((collision_count + 1))
+      return
+    fi
+    reservation_marker_created[reservation_i]=1
     return
   fi
 
   reservation_owner=-1
-  if [ -f "$reservation_path" ] && [ ! -L "$reservation_path" ]; then
-    if existing_marker="$(cat "$reservation_path"; read_status=$?; ((read_status == 0)) || exit "$read_status"; printf x)"; then
-      existing_marker="${existing_marker%x}"
-      for ((reservation_i = 0; reservation_i < reservation_count; reservation_i++)); do
-        if [ "${reservation_markers[reservation_i]}" = "$existing_marker" ]; then
-          reservation_owner="$reservation_i"
-          break
-        fi
-      done
+  for ((reservation_i = 0; reservation_i < reservation_count; reservation_i++)); do
+    if [ "${reservation_marker_created[reservation_i]}" = 1 ] &&
+       [ -d "$reservation_path/${reservation_marker_names[reservation_i]}" ] &&
+       [ ! -L "$reservation_path/${reservation_marker_names[reservation_i]}" ]; then
+      reservation_owner="$reservation_i"
+      break
     fi
-  fi
+  done
 
   if ((reservation_owner >= 0)); then
     collision_messages+=("destination '$reservation_relative' is planned by multiple sources: '${reservation_sources[reservation_owner]}', '$reservation_source'")
@@ -400,23 +416,43 @@ if ((activate_claude_settings == 1)); then
   reserve_destination "$claude_settings" "$settings_destination_relative" "$settings_source_relative"
 fi
 
-# Remove only ordinary files that still carry the nonce written by this
-# initializer. A missing, replaced, symlinked, or unreadable reservation is
-# left untouched and aborts before any template content is changed.
+# Cleanup uses only non-recursive directory removal. A replacement file,
+# symlink, or non-empty directory survives and aborts before template writes.
 reservation_cleanup_failed=0
 for ((i = 0; i < reservation_count; i++)); do
-  current_marker=""
-  if [ -f "${reservation_paths[i]}" ] && [ ! -L "${reservation_paths[i]}" ] &&
-     current_marker="$(cat "${reservation_paths[i]}"; read_status=$?; ((read_status == 0)) || exit "$read_status"; printf x)"; then
-    current_marker="${current_marker%x}"
+  if [ "${reservation_marker_created[i]}" = 1 ]; then
+    if [ ! -d "${reservation_marker_paths[i]}" ] || [ -L "${reservation_marker_paths[i]}" ]; then
+      printf "error: destination reservation '%s' ownership marker changed before cleanup; no template files were changed\n" \
+        "${reservation_relatives[i]}" >&2
+      reservation_cleanup_failed=1
+      continue
+    fi
+
+    if [ "${INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK:-}" = "${reservation_relatives[i]}" ]; then
+      printf '%s\n' 'INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED'
+      if [ -n "${INIT_SECURITY_TEST_READY_FILE:-}" ] &&
+         [ -n "${INIT_SECURITY_TEST_RELEASE_FILE:-}" ]; then
+        printf '%s' ready > "$INIT_SECURITY_TEST_READY_FILE"
+        checkpoint_waits=0
+        while ! entry_exists "$INIT_SECURITY_TEST_RELEASE_FILE"; do
+          ((checkpoint_waits < 1500)) || die "initializer reservation cleanup checkpoint was not released."
+          sleep 0.02
+          checkpoint_waits=$((checkpoint_waits + 1))
+        done
+      elif ! IFS= read -r checkpoint_release || [ "$checkpoint_release" != continue ]; then
+        die "initializer reservation cleanup checkpoint was not released."
+      fi
+    fi
+
+    if ! rmdir "${reservation_marker_paths[i]}"; then
+      printf "error: could not clean destination reservation '%s' ownership marker; no template files were changed\n" \
+        "${reservation_relatives[i]}" >&2
+      reservation_cleanup_failed=1
+      continue
+    fi
   fi
-  if [ "$current_marker" != "${reservation_markers[i]}" ]; then
-    printf "error: destination reservation '%s' changed before cleanup; no template files were changed\n" \
-      "${reservation_relatives[i]}" >&2
-    reservation_cleanup_failed=1
-    continue
-  fi
-  if ! rm -f -- "${reservation_paths[i]}" || entry_exists "${reservation_paths[i]}"; then
+
+  if ! rmdir "${reservation_paths[i]}" || entry_exists "${reservation_paths[i]}"; then
     printf "error: could not clean destination reservation '%s'; no template files were changed\n" \
       "${reservation_relatives[i]}" >&2
     reservation_cleanup_failed=1
