@@ -213,13 +213,18 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
   existing `.claude/settings.json` was overwritten. PowerShell often failed on
   the same collisions only after content replacement had already started.
 - **Root cause:** Renames and shared-settings activation were executed without a
-  complete destination plan; collision discovery was delegated to differing
-  shell move semantics after earlier mutations.
+  checked, filesystem-aware destination plan; collision discovery was delegated
+  to differing shell move semantics after earlier mutations. The POSIX traversal
+  could also return a partial plan without propagating `find` failure.
 - **Rule:** Both initializers preflight every token-path rename and settings
-  activation before the first write, report all conflicting source→destination
-  mappings together, and execute the validated plan with non-overwriting moves.
-  Treat any failed initializer as atomic: file bytes, names, and directories
-  must match the pre-run tree exactly.
+  activation before the first template write, reject incomplete traversals,
+  compare destinations using the repo filesystem's actual case semantics, and
+  report all conflicting source→destination mappings together. Execute content,
+  path, and settings mutations as one rollback domain with non-overwriting moves:
+  a destination that appears after preflight must remain untouched, while the
+  initializer restores the original file bytes, names, and directories. The
+  template security harness verifies both the late-race rollback and that
+  case-distinct targets remain valid on case-sensitive filesystems.
 
 ### 2026-08-20 — template-only initializer checks leaked downstream
 - **Symptom:** An initialized repo retained the initializer security CI step and

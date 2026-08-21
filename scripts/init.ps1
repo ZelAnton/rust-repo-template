@@ -185,6 +185,35 @@ Assert-ReleaseIdentityValue -parameterName 'AuthorEmail' -value $AuthorEmail
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
+function Test-FileSystemCaseInsensitive([string]$root) {
+    # OS checks are insufficient: macOS is commonly case-insensitive, while a
+    # Windows directory may explicitly enable case-sensitive names. Probe the
+    # directory that owns the planned destinations and remove the probe before
+    # building any mutation plan.
+    $leaf = ".initializer-case-probe-$([guid]::NewGuid().ToString('N')).tmp"
+    $probe = Join-Path $root $leaf.ToLowerInvariant()
+    $alias = Join-Path $root $leaf.ToUpperInvariant()
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $probe,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        $stream.Dispose()
+        $stream = $null
+        return Test-Path -LiteralPath $alias
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if (Test-Path -LiteralPath $probe) {
+            Remove-Item -LiteralPath $probe -Force
+        }
+    }
+}
+
+$fileSystemCaseInsensitive = Test-FileSystemCaseInsensitive $repoRoot
+
 $replacements = [ordered]@{
     '__ProjectName__' = $crateSafe
     '__Author__'      = $Author
@@ -216,7 +245,7 @@ $ciWorkflowPath = [IO.Path]::GetFullPath(
 $templateSecurityTestsPath = [IO.Path]::GetFullPath(
     (Join-Path $repoRoot 'tests/init-security')
 )
-$pathComparison = if ($IsWindows) {
+$pathComparison = if ($fileSystemCaseInsensitive) {
     [StringComparison]::OrdinalIgnoreCase
 } else {
     [StringComparison]::Ordinal
@@ -308,7 +337,11 @@ if ($activateClaudeSettings -and -not (Test-Path -LiteralPath $claudeTemplate -P
 }
 
 $collisions = [Collections.Generic.List[string]]::new()
-$targetComparer = if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }
+$targetComparer = if ($fileSystemCaseInsensitive) {
+    [StringComparer]::OrdinalIgnoreCase
+} else {
+    [StringComparer]::Ordinal
+}
 $plannedTargets = [Collections.Generic.Dictionary[string, Collections.Generic.List[string]]]::new($targetComparer)
 
 foreach ($entry in $renamePlan) {
@@ -374,35 +407,113 @@ foreach ($file in $files) {
         $contentPlan.Add([pscustomobject]@{
             Path = $file.FullName
             Content = $new
+            OriginalBytes = [System.IO.File]::ReadAllBytes($file.FullName)
         })
     }
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the literal token strings as search keys, so substituting inside them would
-#    corrupt the sibling script.
-foreach ($entry in $contentPlan) {
-    # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-    [System.IO.File]::WriteAllText($entry.Path, $entry.Content, (New-Object System.Text.UTF8Encoding($false)))
-}
-Write-Host "    Updated contents in $($contentPlan.Count) file(s)." -ForegroundColor DarkGray
-
-# 2) Execute the already validated one-to-one rename plan without overwrite.
-foreach ($entry in $renamePlan) {
-    if (Test-PathEntryExists $entry.Destination) {
-        throw "Destination '$($entry.RelativeDestination)' appeared after preflight; refusing to rename source '$($entry.RelativeSource)'."
+if ($env:INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT -eq '1') {
+    [Console]::Out.WriteLine('INITIALIZER_TEST_PREFLIGHT_READY')
+    if ($env:INIT_SECURITY_TEST_READY_FILE -and $env:INIT_SECURITY_TEST_RELEASE_FILE) {
+        [IO.File]::WriteAllText($env:INIT_SECURITY_TEST_READY_FILE, 'ready')
+        $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $env:INIT_SECURITY_TEST_RELEASE_FILE)) {
+            if ([DateTime]::UtcNow -ge $checkpointDeadline) {
+                throw 'Initializer security test checkpoint was not released.'
+            }
+            Start-Sleep -Milliseconds 20
+        }
+    } elseif ([Console]::In.ReadLine() -cne 'continue') {
+        throw 'Initializer security test checkpoint was not released.'
     }
-    Rename-Item -LiteralPath $entry.Source -NewName $entry.NewName -ErrorAction Stop
-    Write-Host "    Renamed $($entry.OriginalName) -> $($entry.NewName)" -ForegroundColor DarkGray
 }
 
-# 3) Activate Claude Code shared settings without overwrite.
-if ($activateClaudeSettings) {
-    if (Test-PathEntryExists $claudeSettings) {
-        throw "Destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
+# Content changes and path/settings moves form one rollback domain. A late
+# no-overwrite failure reverses completed moves first, then restores the exact
+# original bytes at their original paths. Race-created destinations are never
+# added to the journal and are therefore never removed by rollback.
+$completedRenames = [Collections.Generic.List[object]]::new()
+$settingsActivated = $false
+try {
+    # 1) Replace tokens in file contents. Both initializers are skipped: they
+    #    carry the literal token strings as search keys, so substituting inside
+    #    them would corrupt the sibling script.
+    foreach ($entry in $contentPlan) {
+        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
+        [System.IO.File]::WriteAllText(
+            $entry.Path,
+            $entry.Content,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
     }
-    Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
-    Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+    Write-Host "    Updated contents in $($contentPlan.Count) file(s)." -ForegroundColor DarkGray
+
+    # 2) Execute the already validated one-to-one rename plan without overwrite.
+    foreach ($entry in $renamePlan) {
+        # Journal intent before the move so an exception from Rename-Item itself
+        # is also covered. Rollback treats an extant source as a no-op.
+        $completedRenames.Add($entry)
+        if (Test-PathEntryExists $entry.Destination) {
+            throw "Destination '$($entry.RelativeDestination)' appeared after preflight; refusing to rename source '$($entry.RelativeSource)'."
+        }
+        Rename-Item -LiteralPath $entry.Source -NewName $entry.NewName -ErrorAction Stop
+        Write-Host "    Renamed $($entry.OriginalName) -> $($entry.NewName)" -ForegroundColor DarkGray
+    }
+
+    # 3) Activate Claude Code shared settings without overwrite.
+    if ($activateClaudeSettings) {
+        $settingsActivated = $true
+        if (Test-PathEntryExists $claudeSettings) {
+            throw "Destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
+        }
+        Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
+        Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+    }
+} catch {
+    $originalFailure = $_
+    $rollbackErrors = [Collections.Generic.List[string]]::new()
+
+    if ($settingsActivated) {
+        try {
+            if (Test-PathEntryExists $claudeTemplate) {
+                # The move did not run. Any destination belongs to the racer.
+            } elseif (Test-PathEntryExists $claudeSettings) {
+                Move-Item -LiteralPath $claudeSettings -Destination $claudeTemplate -ErrorAction Stop
+            } else {
+                throw 'neither settings source nor destination exists during rollback'
+            }
+        } catch {
+            $rollbackErrors.Add("settings: $($_.Exception.Message)")
+        }
+    }
+
+    for ($i = $completedRenames.Count - 1; $i -ge 0; $i--) {
+        $entry = $completedRenames[$i]
+        try {
+            if (Test-PathEntryExists $entry.Source) {
+                # The planned move did not run; leave any destination alone.
+            } elseif (Test-PathEntryExists $entry.Destination) {
+                Move-Item -LiteralPath $entry.Destination -Destination $entry.Source -ErrorAction Stop
+            } else {
+                throw "neither source nor destination exists for '$($entry.RelativeSource)'"
+            }
+        } catch {
+            $rollbackErrors.Add("rename '$($entry.RelativeDestination)': $($_.Exception.Message)")
+        }
+    }
+
+    foreach ($entry in $contentPlan) {
+        try {
+            [System.IO.File]::WriteAllBytes($entry.Path, $entry.OriginalBytes)
+        } catch {
+            $rollbackErrors.Add("content '$((Get-RelativeDisplayPath $entry.Path))': $($_.Exception.Message)")
+        }
+    }
+
+    if ($rollbackErrors.Count -gt 0) {
+        throw "Initialization failed and rollback was incomplete: $($originalFailure.Exception.Message)`n  $($rollbackErrors -join "`n  ")"
+    }
+    throw $originalFailure
 }
 
 # 4) Remove template-only files. The agent guide is template meta — pitfalls are

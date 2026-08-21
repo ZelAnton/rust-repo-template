@@ -1,7 +1,8 @@
 #!/usr/bin/env pwsh
 [CmdletBinding()]
 param(
-    [switch]$CollisionOnly
+    [switch]$CollisionOnly,
+    [switch]$RaceOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -108,6 +109,66 @@ function Invoke-CapturedProcess(
     }
 }
 
+function Invoke-CapturedProcessAtCheckpoint(
+    [string]$fileName,
+    [string[]]$arguments,
+    [string]$workingDirectory,
+    [Collections.IDictionary]$environment,
+    [string]$checkpoint,
+    [scriptblock]$onCheckpoint
+) {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $fileName
+    $startInfo.WorkingDirectory = $workingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $checkpointId = [guid]::NewGuid().ToString('N')
+    $readyFile = Join-Path $script:TempRoot "checkpoint-$checkpointId.ready"
+    $releaseFile = Join-Path $script:TempRoot "checkpoint-$checkpointId.release"
+    $environment['INIT_SECURITY_TEST_READY_FILE'] = $readyFile
+    $environment['INIT_SECURITY_TEST_RELEASE_FILE'] = $releaseFile
+    foreach ($entry in $environment.GetEnumerator()) {
+        $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
+    }
+    foreach ($argument in $arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Failed to start $fileName"
+    }
+
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Test-Path -LiteralPath $readyFile) -and -not $process.HasExited) {
+        if ([DateTime]::UtcNow -ge $checkpointDeadline) {
+            $process.Kill($true)
+            throw "Timed out waiting for initializer checkpoint $checkpoint"
+        }
+        Start-Sleep -Milliseconds 20
+    }
+    $observed = Test-Path -LiteralPath $readyFile
+    if ($observed) {
+        & $onCheckpoint
+        [IO.File]::WriteAllText($releaseFile, 'continue')
+    }
+    $process.WaitForExit()
+    $capturedStdout = $stdout.GetAwaiter().GetResult()
+    $capturedStderr = $stderr.GetAwaiter().GetResult()
+    Remove-Item -LiteralPath $readyFile, $releaseFile -Force -ErrorAction SilentlyContinue
+
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout = $capturedStdout
+        Stderr = $capturedStderr
+        CheckpointObserved = $observed -and $capturedStdout.Contains($checkpoint)
+    }
+}
+
 function Assert-ProcessSucceeded($result, [string]$description) {
     if ($result.ExitCode -ne 0) {
         throw "$description failed with exit code $($result.ExitCode).`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
@@ -170,12 +231,13 @@ function Get-InitializerInvocation(
     [string]$authorEmail,
     [switch]$UseDefaultAuthor,
     [switch]$UseDefaultAuthorEmail,
-    [bool]$KeepScript = $true
+    [bool]$KeepScript = $true,
+    [string]$ProjectName = 'init-security'
 ) {
     if ($kind -eq 'powershell') {
         $arguments = @(
             '-NoProfile', '-File', (Join-Path $copyRoot 'scripts/init.ps1'),
-            '-ProjectName', 'init-security', '-GitHubOwner', 'example',
+            '-ProjectName', $ProjectName, '-GitHubOwner', 'example',
             '-Description', 'Initializer security regression fixture',
             '-Year', '2026'
         )
@@ -194,7 +256,7 @@ function Get-InitializerInvocation(
     # the environment, then construct the real initializer argv inside Bash so
     # this harness measures init.sh and Git rather than that Windows shim.
     $command = @'
-arguments=("$1" --project-name init-security --github-owner example \
+arguments=("$1" --project-name "$INIT_PROJECT_NAME" --github-owner example \
   --description "Initializer security regression fixture" --year 2026)
 if [ "$INIT_KEEP_SCRIPT" = "1" ]; then
   arguments+=(--keep-script)
@@ -213,6 +275,7 @@ exec bash "${arguments[@]}"
         Environment = @{
             INIT_AUTHOR = $author
             INIT_AUTHOR_EMAIL = $authorEmail
+            INIT_PROJECT_NAME = $ProjectName
             INIT_USE_DEFAULT_AUTHOR = if ($UseDefaultAuthor) { '1' } else { '0' }
             INIT_USE_DEFAULT_AUTHOR_EMAIL = if ($UseDefaultAuthorEmail) { '1' } else { '0' }
             INIT_KEEP_SCRIPT = if ($KeepScript) { '1' } else { '0' }
@@ -468,6 +531,141 @@ function Test-CollisionMatrix([ValidateSet('powershell', 'posix')][string]$kind)
     )
 }
 
+function Test-CheckedPosixTraversal([ValidateSet('content', 'rename')][string]$phase) {
+    $copyRoot = Join-Path $script:TempRoot "posix-traversal-$phase"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        posix $copyRoot 'Traversal Tester' 'traversal@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_FAIL_TRAVERSAL'] = $phase
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($result.ExitCode -eq 0) {
+        throw "POSIX initializer accepted a partial $phase traversal"
+    }
+    Assert-DiagnosticContains $result `
+        "could not traverse the complete repository $phase tree; no files were changed" `
+        "POSIX initializer returned an unclear diagnostic for a failed $phase traversal."
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "POSIX initializer mutated the tree after a failed $phase traversal"
+}
+
+function Test-CaseInsensitiveFileSystem([string]$root) {
+    $leaf = ".harness-case-probe-$([guid]::NewGuid().ToString('N')).tmp"
+    $probe = Join-Path $root $leaf.ToLowerInvariant()
+    $alias = Join-Path $root $leaf.ToUpperInvariant()
+    try {
+        [IO.File]::WriteAllText($probe, 'probe', (New-Object Text.UTF8Encoding($false)))
+        return Test-Path -LiteralPath $alias
+    } finally {
+        if (Test-Path -LiteralPath $probe) {
+            Remove-Item -LiteralPath $probe -Force
+        }
+    }
+}
+
+function Test-CaseAliasDestinations(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-case-alias"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-case-alias/__ProjectName__A.txt' 'upper target'
+    Add-TextFixture $copyRoot '.initializer-case-alias/a__ProjectName__.txt' 'lower target'
+    $caseInsensitive = Test-CaseInsensitiveFileSystem $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        -kind $kind `
+        -copyRoot $copyRoot `
+        -author 'Case Tester' `
+        -authorEmail 'case@example.com' `
+        -ProjectName 'a'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($caseInsensitive) {
+        if ($result.ExitCode -eq 0) {
+            throw "$kind initializer accepted case-alias destinations on a case-insensitive filesystem"
+        }
+        Assert-DiagnosticContains $result `
+            'is planned by multiple sources' `
+            "$kind initializer did not report the case-alias destination collision."
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer mutated a case-insensitive case-alias fixture"
+        return
+    }
+
+    Assert-ProcessSucceeded $result "$kind case-sensitive case-alias initialization"
+    foreach ($entry in @(
+        @('.initializer-case-alias/aA.txt', 'upper target'),
+        @('.initializer-case-alias/aa.txt', 'lower target')
+    )) {
+        $path = Join-Path $copyRoot $entry[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$kind initializer falsely collapsed case-distinct destination $($entry[0])"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($path)) `
+            $entry[1] `
+            "$kind initializer changed case-distinct destination $($entry[0])"
+    }
+}
+
+function Test-LateRaceRollback(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-late-race"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-race/a-__ProjectName__.txt' `
+        'first source __Description__'
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-race/z-__ProjectName__.txt' `
+        'second source __Description__'
+    $before = Get-TreeFingerprint $copyRoot
+    $raceDestination = Join-Path $copyRoot '.initializer-race/z-init-security.txt'
+    $raceContent = 'external destination must survive'
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Race Tester' 'race@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT'] = '1'
+    $result = Invoke-CapturedProcessAtCheckpoint `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment `
+        'INITIALIZER_TEST_PREFLIGHT_READY' `
+        { Add-TextFixture $copyRoot '.initializer-race/z-init-security.txt' $raceContent }
+
+    if (-not $result.CheckpointObserved) {
+        throw "$kind initializer did not expose the deterministic post-preflight checkpoint"
+    }
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a destination created after preflight"
+    }
+    Assert-DiagnosticContains $result `
+        "appeared after preflight; refusing to rename source '.initializer-race/z-__ProjectName__.txt'" `
+        "$kind initializer returned an unclear late-race diagnostic."
+    if (-not (Test-Path -LiteralPath $raceDestination -PathType Leaf)) {
+        throw "$kind initializer rollback removed the external race destination"
+    }
+    Assert-Equal `
+        ([IO.File]::ReadAllText($raceDestination)) `
+        $raceContent `
+        "$kind initializer rollback changed the external race destination"
+
+    Remove-Item -LiteralPath $raceDestination -Force
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer did not restore the original tree after a late race"
+}
+
 function Test-RejectedLineBreak(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('author', 'email')][string]$field
@@ -596,10 +794,23 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    if ($RaceOnly) {
+        foreach ($kind in @('powershell', 'posix')) {
+            Test-LateRaceRollback $kind
+        }
+        Write-Host 'Initializer late-race rollback checks passed.' -ForegroundColor Green
+        return
+    }
+
+    foreach ($phase in @('content', 'rename')) {
+        Test-CheckedPosixTraversal $phase
+    }
     foreach ($kind in @('powershell', 'posix')) {
         Test-CollisionMatrix $kind
+        Test-CaseAliasDestinations $kind
+        Test-LateRaceRollback $kind
     }
-    Write-Host 'Initializer collision preflight checks passed.' -ForegroundColor Green
+    Write-Host 'Initializer traversal, collision, and rollback checks passed.' -ForegroundColor Green
     if ($CollisionOnly) {
         return
     }

@@ -150,8 +150,116 @@ echo "==> Initializing template as '$crate_name'"
 
 entry_exists() { [ -e "$1" ] || [ -L "$1" ]; }
 
+transaction_dir="$(mktemp -d "${TMPDIR:-/tmp}/rust-template-init.XXXXXX")" ||
+  die "could not create initializer transaction directory."
+transaction_active=0
+transaction_committed=0
+completed_rename_indices=()
+completed_rename_count=0
+settings_was_activated=0
+content_plan_files=()
+content_plan_originals=()
+content_plan_updates=()
+content_plan_count=0
+
+rollback_transaction() {
+  rollback_failed=0
+
+  if ((settings_was_activated == 1)); then
+    if entry_exists "$claude_template" && entry_exists "$claude_settings"; then
+      : # The planned move never ran; the destination belongs to the racer.
+    elif entry_exists "$claude_template" && ! entry_exists "$claude_settings"; then
+      : # The planned move never ran and there is nothing to undo.
+    elif entry_exists "$claude_settings" && mv -n "$claude_settings" "$claude_template"; then
+      :
+    else
+      printf '%s\n' 'error: rollback could not restore .claude/settings.json.template' >&2
+      rollback_failed=1
+    fi
+  fi
+
+  for ((rollback_i = completed_rename_count - 1; rollback_i >= 0; rollback_i--)); do
+    plan_i="${completed_rename_indices[rollback_i]}"
+    if entry_exists "${rename_sources[plan_i]}"; then
+      : # The planned move never ran; leave any race-created destination alone.
+    elif entry_exists "${rename_destinations[plan_i]}" &&
+         mv -n "${rename_destinations[plan_i]}" "${rename_sources[plan_i]}"; then
+      :
+    else
+      printf "error: rollback could not restore source '%s'\n" \
+        "${rename_source_relatives[plan_i]}" >&2
+      rollback_failed=1
+    fi
+  done
+
+  for ((rollback_i = 0; rollback_i < content_plan_count; rollback_i++)); do
+    if ! cp "${content_plan_originals[rollback_i]}" "${content_plan_files[rollback_i]}"; then
+      printf "error: rollback could not restore content '%s'\n" \
+        "${content_plan_files[rollback_i]#"$repo_root"/}" >&2
+      rollback_failed=1
+    fi
+  done
+
+  return "$rollback_failed"
+}
+
+finish_initializer() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if ((status != 0 && transaction_active == 1 && transaction_committed == 0)); then
+    set +e
+    if ! rollback_transaction; then
+      printf '%s\n' 'error: initialization rollback was incomplete' >&2
+    fi
+  fi
+  rm -rf "$transaction_dir"
+  exit "$status"
+}
+
+trap 'finish_initializer' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Probe the actual destination filesystem. OS-name checks are insufficient for
+# default case-insensitive macOS volumes and case-sensitive Windows directories.
+case_probe_token="$RANDOM-$$"
+case_probe="$repo_root/.initializer-case-probe-$case_probe_token.tmp"
+case_probe_alias="$repo_root/.INITIALIZER-CASE-PROBE-$case_probe_token.TMP"
+if ! (set -o noclobber; : > "$case_probe") 2>/dev/null; then
+  die "could not create filesystem case-sensitivity probe."
+fi
+filesystem_case_insensitive=0
+if [ "$case_probe" -ef "$case_probe_alias" ]; then
+  filesystem_case_insensitive=1
+fi
+rm -f "$case_probe"
+
+collision_key() {
+  if ((filesystem_case_insensitive == 1)); then
+    key="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'; printf x)"
+    printf '%s' "${key%x}"
+  else
+    printf '%s' "$1"
+  fi
+}
+
 # Build every mutation plan before the first write. The arrays deliberately use
 # Bash 3-compatible indexed arrays so the initializer retains macOS support.
+content_manifest="$transaction_dir/content-files"
+if [ "${INIT_SECURITY_TEST_FAIL_TRAVERSAL:-}" = content ]; then
+  printf '%s\0' "$repo_root/Cargo.toml" > "$content_manifest"
+  content_find_status=73
+elif find "$repo_root" \
+    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
+    -o -type f -print0 > "$content_manifest"; then
+  content_find_status=0
+else
+  content_find_status=$?
+fi
+if ((content_find_status != 0)); then
+  die "could not traverse the complete repository content tree; no files were changed."
+fi
 content_files=()
 content_count=0
 while IFS= read -r -d '' file; do
@@ -160,11 +268,7 @@ while IFS= read -r -d '' file; do
   esac
   content_files[content_count]="$file"
   content_count=$((content_count + 1))
-done < <(
-  find "$repo_root" \
-    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
-    -o -type f -print0
-)
+done < "$content_manifest"
 
 # Keep the content and rename plans deterministic without relying on GNU
 # `sort -z`, which is absent from the default macOS toolchain.
@@ -184,6 +288,20 @@ rename_source_relatives=()
 rename_destination_relatives=()
 rename_depths=()
 rename_count=0
+rename_manifest="$transaction_dir/rename-sources"
+if [ "${INIT_SECURITY_TEST_FAIL_TRAVERSAL:-}" = rename ]; then
+  printf '%s\0' "$repo_root/Cargo.toml" > "$rename_manifest"
+  rename_find_status=73
+elif find "$repo_root" \
+    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
+    -o -name '*__ProjectName__*' -print0 > "$rename_manifest"; then
+  rename_find_status=0
+else
+  rename_find_status=$?
+fi
+if ((rename_find_status != 0)); then
+  die "could not traverse the complete repository rename tree; no files were changed."
+fi
 while IFS= read -r -d '' item; do
   dir="${item%/*}"
   base="${item##*/}"
@@ -203,11 +321,7 @@ while IFS= read -r -d '' item; do
   rename_destination_relatives[rename_count]="$destination_relative"
   rename_depths[rename_count]="$depth"
   rename_count=$((rename_count + 1))
-done < <(
-  find "$repo_root" \
-    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
-    -o -name '*__ProjectName__*' -print0
-)
+done < "$rename_manifest"
 
 # Deepest sources run first; equal-depth paths use lexical order. This mirrors
 # init.ps1 and prevents a parent rename from invalidating an unprocessed child.
@@ -258,13 +372,14 @@ for ((i = 0; i < rename_count; i++)); do
     collision_messages+=("destination '${rename_destination_relatives[i]}' already exists (source '${rename_source_relatives[i]}')")
     collision_count=$((collision_count + 1))
   fi
+  target_key="$(collision_key "${rename_destinations[i]}")"
   for ((j = 0; j < planned_target_count; j++)); do
-    if [ "${planned_targets[j]}" = "${rename_destinations[i]}" ]; then
+    if [ "${planned_targets[j]}" = "$target_key" ]; then
       collision_messages+=("destination '${rename_destination_relatives[i]}' is planned by multiple sources: '${planned_target_sources[j]}', '${rename_source_relatives[i]}'")
       collision_count=$((collision_count + 1))
     fi
   done
-  planned_targets[planned_target_count]="${rename_destinations[i]}"
+  planned_targets[planned_target_count]="$target_key"
   planned_target_sources[planned_target_count]="${rename_source_relatives[i]}"
   planned_target_count=$((planned_target_count + 1))
 done
@@ -275,8 +390,9 @@ if ((activate_claude_settings == 1)); then
     collision_messages+=("destination '$settings_destination_relative' already exists (source '$settings_source_relative')")
     collision_count=$((collision_count + 1))
   fi
+  settings_target_key="$(collision_key "$claude_settings")"
   for ((j = 0; j < planned_target_count; j++)); do
-    if [ "${planned_targets[j]}" = "$claude_settings" ]; then
+    if [ "${planned_targets[j]}" = "$settings_target_key" ]; then
       collision_messages+=("destination '$settings_destination_relative' is planned by multiple sources: '${planned_target_sources[j]}', '$settings_source_relative'")
       collision_count=$((collision_count + 1))
     fi
@@ -339,63 +455,114 @@ substitute_tokens() {
     }'
 }
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the literal token strings as search keys, so substituting inside them would
-#    corrupt the sibling script.
-changed=0
+# Materialize exact originals and final replacement bytes before the first
+# template write. This makes content rollback byte-for-byte and ensures every
+# transform error is still a preflight error.
+mkdir -p "$transaction_dir/originals" "$transaction_dir/updates"
 for ((i = 0; i < content_count; i++)); do
   file="${content_files[i]}"
+  original="$transaction_dir/originals/$i"
+  update="$transaction_dir/updates/$i"
+  candidate="$transaction_dir/candidate-$i"
+  if ! cp "$file" "$original"; then
+    die "could not snapshot '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
   case "$file" in
     *.toml) c=$crate_t; a=$author_t; ae=$author_email_t; o=$owner_t; d=$desc_t; y=$year_t ;;
     *)      c=$crate_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
   esac
   # Preserve trailing newlines: append a sentinel before capture, strip it after.
-  content="$(cat "$file"; printf x)"; content="${content%x}"
+  if ! content="$(cat "$original"; read_status=$?; ((read_status == 0)) || exit "$read_status"; printf x)"; then
+    die "could not read '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
+  content="${content%x}"
   if [ "$file" = "$release_workflow" ]; then
     a="$author_release"
     ae="$author_email_release"
   fi
-  new="$(TPL_SRC="$content" TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
-         TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" substitute_tokens; printf x)"
+  if ! new="$(TPL_SRC="$content" TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
+         TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" substitute_tokens; transform_status=$?; \
+         ((transform_status == 0)) || exit "$transform_status"; printf x)"; then
+    die "could not transform '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
   new="${new%x}"
-  if [ "$new" != "$content" ]; then
-    printf '%s' "$new" > "$file"
-    changed=$((changed + 1))
+
+  if [ "$file" = "$ci_workflow" ]; then
+    if ! printf '%s' "$new" > "$candidate"; then
+      die "could not stage .github/workflows/ci.yml during preflight; no files were changed."
+    fi
+    if ! awk '
+      /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
+        if (inside || seen) exit 42
+        inside = 1
+        seen = 1
+        next
+      }
+      /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
+        if (!inside) exit 42
+        inside = 0
+        next
+      }
+      !inside { print }
+      END { if (inside || seen != 1) exit 42 }
+    ' "$candidate" > "$update"; then
+      die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
+    fi
+  elif ! printf '%s' "$new" > "$update"; then
+    die "could not stage '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
+
+  if cmp -s "$original" "$update"; then
+    rm -f "$original" "$update" "$candidate"
+  else
+    compare_status=$?
+    if ((compare_status > 1)); then
+      die "could not compare staged content for '${file#"$repo_root"/}'; no files were changed."
+    fi
+    content_plan_files[content_plan_count]="$file"
+    content_plan_originals[content_plan_count]="$original"
+    content_plan_updates[content_plan_count]="$update"
+    content_plan_count=$((content_plan_count + 1))
   fi
 done
-echo "    Updated contents in $changed file(s)."
 
-# The security harness tests the template's initializer implementation. It is
-# not a downstream project check, so remove its workflow block together with
-# the harness instead of leaving a CI step that targets deleted init scripts.
-ci_without_template_step="$ci_workflow.template-only.$$"
-if ! awk '
-  /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
-    if (inside || seen) exit 42
-    inside = 1
-    seen = 1
-    next
-  }
-  /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
-    if (!inside) exit 42
-    inside = 0
-    next
-  }
-  !inside { print }
-  END { if (inside || seen != 1) exit 42 }
-' "$ci_workflow" > "$ci_without_template_step"; then
-  rm -f "$ci_without_template_step"
-  die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
+if [ "${INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT:-}" = "1" ]; then
+  printf '%s\n' 'INITIALIZER_TEST_PREFLIGHT_READY'
+  if [ -n "${INIT_SECURITY_TEST_READY_FILE:-}" ] &&
+     [ -n "${INIT_SECURITY_TEST_RELEASE_FILE:-}" ]; then
+    printf '%s' ready > "$INIT_SECURITY_TEST_READY_FILE"
+    checkpoint_waits=0
+    while ! entry_exists "$INIT_SECURITY_TEST_RELEASE_FILE"; do
+      checkpoint_waits=$((checkpoint_waits + 1))
+      ((checkpoint_waits < 600)) || die "initializer security test checkpoint was not released."
+      sleep 0.05
+    done
+  else
+    IFS= read -r checkpoint_release || die "initializer security test checkpoint was not released."
+    [ "$checkpoint_release" = continue ] || die "initializer security test checkpoint was not released."
+  fi
 fi
-mv -f "$ci_without_template_step" "$ci_workflow"
+
+transaction_active=1
+
+# 1) Apply the staged content plan. Both initializers are skipped because they
+#    carry the literal token strings as search keys.
+for ((i = 0; i < content_plan_count; i++)); do
+  if ! cp "${content_plan_updates[i]}" "${content_plan_files[i]}"; then
+    die "could not update '${content_plan_files[i]#"$repo_root"/}'."
+  fi
+done
+echo "    Updated contents in $content_plan_count file(s)."
 
 # 2) Execute the already validated one-to-one rename plan without overwrite.
 for ((i = 0; i < rename_count; i++)); do
+  completed_rename_indices[completed_rename_count]="$i"
+  completed_rename_count=$((completed_rename_count + 1))
   if entry_exists "${rename_destinations[i]}"; then
     die "destination '${rename_destination_relatives[i]}' appeared after preflight; refusing to rename source '${rename_source_relatives[i]}'."
   fi
-  mv -n "${rename_sources[i]}" "${rename_destinations[i]}"
-  if entry_exists "${rename_sources[i]}"; then
+  if ! mv -n "${rename_sources[i]}" "${rename_destinations[i]}" ||
+     entry_exists "${rename_sources[i]}" || ! entry_exists "${rename_destinations[i]}"; then
     die "non-overwriting rename refused destination '${rename_destination_relatives[i]}' for source '${rename_source_relatives[i]}'."
   fi
   echo "    Renamed ${rename_sources[i]##*/} -> ${rename_destinations[i]##*/}"
@@ -404,15 +571,18 @@ done
 # 3) Activate Claude Code shared settings from the shipped .template (renames
 #    .claude/settings.json.template -> .claude/settings.json).
 if ((activate_claude_settings == 1)); then
+  settings_was_activated=1
   if entry_exists "$claude_settings"; then
     die "destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
   fi
-  mv -n "$claude_template" "$claude_settings"
-  if entry_exists "$claude_template"; then
+  if ! mv -n "$claude_template" "$claude_settings" || entry_exists "$claude_template" ||
+     ! entry_exists "$claude_settings"; then
     die "non-overwriting settings activation refused destination '.claude/settings.json'."
   fi
   echo "    Activated .claude/settings.json"
 fi
+
+transaction_committed=1
 
 # 4) Remove template-only files (the agent guide is template meta — pitfalls are
 #    logged back to the *template's* copy, so the downstream repo drops it).
