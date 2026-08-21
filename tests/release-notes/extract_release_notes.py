@@ -15,6 +15,7 @@ UNRELEASED_RE = re.compile(
 SECTION_HEADER_RE = re.compile(r"^###[ \t]+\S")
 BULLET_MARKER_RE = re.compile(r"^-(?:$|(?P<padding>[ \t]+)(?P<content>\S.*)?)$")
 CHECK_EMPTY_EXIT = 3
+CHECK_UNSECTIONED_EXIT = 4
 
 
 def _advance_column(column: int, whitespace: str) -> int:
@@ -112,13 +113,26 @@ def _render_section(header: str, lines: list[str]) -> str | None:
     return "\n".join(rendered)
 
 
+def _unreleased_body_lines(changelog: str) -> list[str] | None:
+    match = UNRELEASED_RE.search(changelog)
+    return None if match is None else match.group(1).splitlines()
+
+
+def _has_unsectioned_manual_bullet(lines: list[str]) -> bool:
+    """Return whether a real bullet appears before the first ``###`` section."""
+    first_section = next(
+        (index for index, line in enumerate(lines) if SECTION_HEADER_RE.match(line)),
+        len(lines),
+    )
+    return bool(_bullet_spans(lines[:first_section]))
+
+
 def extract_release_notes(changelog: str) -> str:
     """Return populated ``###`` sections from the bounded Unreleased body."""
-    match = UNRELEASED_RE.search(changelog)
-    if not match:
+    body_lines = _unreleased_body_lines(changelog)
+    if body_lines is None:
         return ""
 
-    body_lines = match.group(1).splitlines()
     sections: list[str] = []
     index = 0
 
@@ -153,6 +167,21 @@ def main(argv: Sequence[str]) -> int:
         changelog = _read_changelog(Path(argv[2]))
         if changelog is None:
             return 2
+        body_lines = _unreleased_body_lines(changelog)
+        if body_lines is None:
+            print(
+                "::error::Could not find '## [Unreleased]' header in CHANGELOG.md",
+                file=sys.stderr,
+            )
+            return 2
+        if _has_unsectioned_manual_bullet(body_lines):
+            print(
+                "::error::[Unreleased] contains a manual top-level bullet outside "
+                "a '###' section. Move every manual bullet under a supported '###' "
+                "section before releasing; CHANGELOG.md was left unchanged.",
+                file=sys.stderr,
+            )
+            return CHECK_UNSECTIONED_EXIT
         # A dedicated status keeps Python/import failures (normally exit 1)
         # distinct from the one state where auto-fill is allowed.
         return 0 if extract_release_notes(changelog) else CHECK_EMPTY_EXIT

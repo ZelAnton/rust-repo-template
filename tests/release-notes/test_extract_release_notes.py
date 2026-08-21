@@ -311,13 +311,41 @@ This paragraph is outside the list item.
 
     def test_check_mode_uses_dedicated_exit_for_valid_empty_notes(self) -> None:
         cases = [
-            ("manual bare-marker content", changelog("\n### Added\n-\n  Kept.\n"), 0),
-            ("placeholder-only", changelog("\n### Added\n-\n"), 3),
+            (
+                "manual bare-marker content",
+                changelog("\n### Added\n-\n  Kept.\n"),
+                0,
+                "",
+            ),
+            ("placeholder-only", changelog("\n### Added\n-\n"), 3, ""),
+            ("unsectioned placeholder-only", changelog("\n-\n"), 3, ""),
+            (
+                "unsectioned manual bullet",
+                changelog("\n- Curated note.\n"),
+                4,
+                "::error::[Unreleased] contains a manual top-level bullet outside "
+                "a '###' section. Move every manual bullet under a supported '###' "
+                "section before releasing; CHANGELOG.md was left unchanged.\n",
+            ),
+            (
+                "unsectioned bullet alongside renderable notes",
+                changelog("\n- Curated preface.\n\n### Added\n- Renderable note.\n"),
+                4,
+                "::error::[Unreleased] contains a manual top-level bullet outside "
+                "a '###' section. Move every manual bullet under a supported '###' "
+                "section before releasing; CHANGELOG.md was left unchanged.\n",
+            ),
+            (
+                "missing Unreleased header",
+                "# Changelog\n\n## [1.0.0]\n- Historical note.\n",
+                2,
+                "::error::Could not find '## [Unreleased]' header in CHANGELOG.md\n",
+            ),
         ]
 
         with tempfile.TemporaryDirectory() as directory:
             source_path = Path(directory) / "CHANGELOG.md"
-            for name, source, expected_status in cases:
+            for name, source, expected_status, expected_stderr in cases:
                 with self.subTest(name=name):
                     source_path.write_text(source, encoding="utf-8")
                     result = subprocess.run(
@@ -328,7 +356,7 @@ This paragraph is outside the list item.
                     )
                     self.assertEqual(result.returncode, expected_status, result.stderr)
                     self.assertEqual(result.stdout, "")
-                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(result.stderr, expected_stderr)
 
             missing = subprocess.run(
                 [sys.executable, str(SCRIPT), "--check", str(source_path) + ".missing"],
@@ -397,6 +425,32 @@ This paragraph is outside the list item.
                     (root / "release-notes.md").read_text(encoding="utf-8"),
                     expected_notes,
                 )
+
+        with (
+            self.subTest(name="unsectioned manual bullet fails closed"),
+            tempfile.TemporaryDirectory() as directory,
+        ):
+            root = Path(directory)
+            source = changelog("\n- Curated note outside a supported section.\n")
+            original = source.encode("utf-8")
+            self._prepare_workflow_fixture(root, source)
+            environment = self._workflow_environment(
+                root,
+                cliff_output="### Added\n- Must not replace the changelog.\n",
+            )
+
+            gate = subprocess.run(
+                [bash, "-c", auto_fill],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(gate.returncode, 4)
+            self.assertIn("manual top-level bullet outside a '###' section", gate.stderr)
+            self.assertFalse((root / "git-cliff.called").exists())
+            self.assertEqual((root / "CHANGELOG.md").read_bytes(), original)
 
         with (
             self.subTest(name="placeholder-only auto-fills"),
