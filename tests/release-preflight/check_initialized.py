@@ -19,6 +19,7 @@ PLACEHOLDER_NAMES = (
 INITIALIZATION_SURFACES = (
     Path("Cargo.toml"),
     Path("Cargo.lock"),
+    Path(".github/CODEOWNERS"),
     Path(".github/workflows/release.yml"),
     Path("LICENSE"),
     Path("README.md"),

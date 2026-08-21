@@ -92,6 +92,10 @@ def write_fixture(root: Path, *, initialized: bool) -> None:
         f'  RELEASE_GIT_AUTHOR_EMAIL_B64: "{author_email}"\n',
         encoding="utf-8",
     )
+    (root / ".github" / "CODEOWNERS").write_text(
+        f"* @{owner}\n",
+        encoding="utf-8",
+    )
     (root / "LICENSE").write_text(f"Copyright {year} {author}\n", encoding="utf-8")
 
     if not initialized:
@@ -190,6 +194,33 @@ class ReleaseInitializationPreflightTests(unittest.TestCase):
             self.assertIn(
                 "release.yml still contains initialization placeholders",
                 leftover_placeholder.stderr,
+            )
+
+    def test_codeowners_placeholder_alone_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root, initialized=True)
+            (root / ".github" / "CODEOWNERS").write_text(
+                f"* @{token('GitHubOwner')}\n",
+                encoding="utf-8",
+            )
+
+            result = run_contract(root)
+
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout, "")
+            codeowners_path = (
+                ".github\\CODEOWNERS" if os.name == "nt" else ".github/CODEOWNERS"
+            )
+            self.assertEqual(
+                result.stderr,
+                "::error::Release blocked: project initialization is incomplete.\n"
+                f"::error:: - {codeowners_path} still contains initialization "
+                "placeholders: GitHubOwner\n"
+                "::error::Initialize the repository before releasing: "
+                "pwsh ./scripts/init.ps1 -ProjectName <crate-name>\n"
+                "::error::POSIX alternative: "
+                "bash ./scripts/init.sh --project-name <crate-name>\n",
             )
 
     def test_malformed_or_missing_manifest_fails_closed(self) -> None:
