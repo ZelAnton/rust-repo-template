@@ -8,7 +8,8 @@ param(
     [switch]$GitFileOnly,
     [switch]$NoGitOnly,
     [switch]$DuplicateGitPathOnly,
-    [switch]$ReleaseIdentityOnly
+    [switch]$ReleaseIdentityOnly,
+    [switch]$TomlOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -241,13 +242,15 @@ function Get-InitializerInvocation(
     [switch]$UseDefaultAuthor,
     [switch]$UseDefaultAuthorEmail,
     [bool]$KeepScript = $true,
-    [string]$ProjectName = 'init-security'
+    [string]$ProjectName = 'init-security',
+    [string]$GitHubOwner = 'example',
+    [string]$Description = 'Initializer security regression fixture'
 ) {
     if ($kind -eq 'powershell') {
         $arguments = @(
             '-NoProfile', '-File', (Join-Path $copyRoot 'scripts/init.ps1'),
-            '-ProjectName', $ProjectName, '-GitHubOwner', 'example',
-            '-Description', 'Initializer security regression fixture',
+            '-ProjectName', $ProjectName, '-GitHubOwner', $GitHubOwner,
+            '-Description', $Description,
             '-Year', '2026'
         )
         if ($KeepScript) { $arguments += '-KeepScript' }
@@ -265,8 +268,8 @@ function Get-InitializerInvocation(
     # the environment, then construct the real initializer argv inside Bash so
     # this harness measures init.sh and Git rather than that Windows shim.
     $command = @'
-arguments=("$1" --project-name "$INIT_PROJECT_NAME" --github-owner example \
-  --description "Initializer security regression fixture" --year 2026)
+arguments=("$1" --project-name "$INIT_PROJECT_NAME" --github-owner "$INIT_GITHUB_OWNER" \
+  --description "$INIT_DESCRIPTION" --year 2026)
 if [ "$INIT_KEEP_SCRIPT" = "1" ]; then
   arguments+=(--keep-script)
 fi
@@ -285,11 +288,176 @@ exec bash "${arguments[@]}"
             INIT_AUTHOR = $author
             INIT_AUTHOR_EMAIL = $authorEmail
             INIT_PROJECT_NAME = $ProjectName
+            INIT_GITHUB_OWNER = $GitHubOwner
+            INIT_DESCRIPTION = $Description
             INIT_USE_DEFAULT_AUTHOR = if ($UseDefaultAuthor) { '1' } else { '0' }
             INIT_USE_DEFAULT_AUTHOR_EMAIL = if ($UseDefaultAuthorEmail) { '1' } else { '0' }
             INIT_KEEP_SCRIPT = if ($KeepScript) { '1' } else { '0' }
         }
     }
+}
+
+function Add-TomlRoundTripFixture([string]$copyRoot) {
+    Add-TextFixture $copyRoot '.initializer-toml-fixture/values.toml' @'
+project = "__ProjectName__"
+author = "__Author__"
+author_email = "__AuthorEmail__"
+github_owner = "__GitHubOwner__"
+description = "__Description__"
+year = "__Year__"
+'@
+}
+
+function Read-TomlAsJson([string]$path, [string]$description) {
+    $parser = Invoke-CapturedProcess $script:PythonPath @(
+        '-c',
+        'import json, pathlib, sys, tomllib; print(json.dumps(tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")), ensure_ascii=False))',
+        $path
+    ) (Split-Path -Parent $path) @{ PYTHONIOENCODING = 'utf-8' }
+    Assert-ProcessSucceeded $parser $description
+    $parser.Stdout | ConvertFrom-Json
+}
+
+function Test-TomlBasicStringRoundTrip(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [string]$caseName,
+    [string]$description,
+    [string]$githubOwner
+) {
+    $expectedDescription = $description
+    $expectedOwner = $githubOwner
+    $copyRoot = Join-Path $script:TempRoot "$kind-toml-round-trip-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TomlRoundTripFixture $copyRoot
+
+    $author = 'TOML Round Trip Author'
+    $authorEmail = 'toml-round-trip@example.com'
+    $invocation = Get-InitializerInvocation $kind $copyRoot $author $authorEmail `
+        -Description $expectedDescription -GitHubOwner $expectedOwner
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind TOML basic-string round trip ($caseName)"
+
+    $fixture = Read-TomlAsJson `
+        (Join-Path $copyRoot '.initializer-toml-fixture/values.toml') `
+        "$kind generated TOML fixture parse ($caseName)"
+    Assert-Equal $fixture.project 'init-security' "$kind TOML project round trip failed ($caseName)"
+    Assert-Equal $fixture.author $author "$kind TOML author round trip failed ($caseName)"
+    Assert-Equal $fixture.author_email $authorEmail "$kind TOML author-email round trip failed ($caseName)"
+    Assert-Equal $fixture.github_owner $expectedOwner "$kind TOML owner round trip failed ($caseName)"
+    Assert-Equal $fixture.description $expectedDescription "$kind TOML description round trip failed ($caseName)"
+    Assert-Equal $fixture.year '2026' "$kind TOML year round trip failed ($caseName)"
+
+    # Cargo is the production parser for Cargo.toml. Its JSON view also proves
+    # the parsed values were not double-escaped or otherwise normalized.
+    $metadataResult = Invoke-CapturedProcess 'cargo' @(
+        'metadata', '--no-deps', '--format-version', '1'
+    ) $copyRoot
+    Assert-ProcessSucceeded $metadataResult "$kind Cargo.toml parse ($caseName)"
+    $package = ($metadataResult.Stdout | ConvertFrom-Json).packages[0]
+    Assert-Equal `
+        ([string]$package.description) `
+        ([string]$expectedDescription) `
+        "$kind Cargo description round trip failed ($caseName)"
+    Assert-Equal `
+        $package.repository `
+        "https://github.com/$expectedOwner/init-security" `
+        "$kind Cargo repository round trip failed ($caseName)"
+}
+
+function ConvertTo-PosixPath([string]$path) {
+    if (-not $IsWindows) {
+        return $path
+    }
+    $converted = Invoke-CapturedProcess $script:BashPath @(
+        '-c', 'cygpath -u "$1"', 'toml-path-conversion', $path
+    ) $script:TempRoot
+    Assert-ProcessSucceeded $converted 'Git Bash temporary-path conversion'
+    $converted.Stdout.Trim()
+}
+
+function Test-RejectedTomlControl(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [string]$caseName,
+    [char]$character,
+    [string]$codePoint
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-toml-reject-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $transactionRoot = Join-Path $script:TempRoot "$kind-toml-reject-$caseName-transactions"
+    [void](New-Item -ItemType Directory -Path $transactionRoot)
+
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Valid Author' 'valid@example.com' `
+        -Description "before${character}after"
+    if ($kind -eq 'posix') {
+        $invocation.Environment['TMPDIR'] = ConvertTo-PosixPath $transactionRoot
+    } else {
+        $invocation.Environment['TEMP'] = $transactionRoot
+        $invocation.Environment['TMP'] = $transactionRoot
+    }
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted unsupported TOML control $codePoint ($caseName)"
+    }
+    Assert-DiagnosticContains $result `
+        "control character $codePoint is unsupported in TOML string input; no files were changed" `
+        "$kind initializer returned an unclear TOML-control diagnostic ($caseName)."
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer mutated files before rejecting TOML control $codePoint ($caseName)"
+    $artifacts = @(Get-ChildItem -LiteralPath $transactionRoot -Force)
+    Assert-Equal `
+        $artifacts.Count `
+        0 `
+        "$kind initializer created temporary transaction artifacts before rejecting TOML control $codePoint ($caseName)"
+}
+
+function Test-ShouldRunTomlSuite([bool]$tomlOnly, [bool]$hasOtherSelector) {
+    $tomlOnly -or -not $hasOtherSelector
+}
+
+function Test-TomlSuiteRoutingContract {
+    Assert-Equal `
+        (Test-ShouldRunTomlSuite -tomlOnly:$false -hasOtherSelector:$false) `
+        $true `
+        'Default init-security routing omitted the TOML regression suite'
+    Assert-Equal `
+        (Test-ShouldRunTomlSuite -tomlOnly:$true -hasOtherSelector:$false) `
+        $true `
+        'Focused TOML routing omitted the TOML regression suite'
+    Assert-Equal `
+        (Test-ShouldRunTomlSuite -tomlOnly:$false -hasOtherSelector:$true) `
+        $false `
+        'A non-TOML focused selector unexpectedly enabled the TOML regression suite'
+}
+
+function Invoke-TomlBasicStringSuite {
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-TomlBasicStringRoundTrip `
+            $kind `
+            'quotes-backslashes' `
+            'quoted "value" with path\segment' `
+            'owner"quoted\path'
+        Test-TomlBasicStringRoundTrip `
+            $kind `
+            'short-controls' `
+            "line one`nline two`rreturn`ttab`bbackspace`fform-feed" `
+            "owner`ttab"
+        foreach ($case in @(
+            @{ Name = 'vertical-tab'; Character = [char]0x0b; CodePoint = 'U+000B' },
+            @{ Name = 'escape'; Character = [char]0x1b; CodePoint = 'U+001B' },
+            @{ Name = 'delete'; Character = [char]0x7f; CodePoint = 'U+007F' }
+        )) {
+            Test-RejectedTomlControl `
+                $kind $case.Name $case.Character $case.CodePoint
+        }
+    }
+    Write-Host 'Initializer TOML basic-string parity checks passed.' -ForegroundColor Green
 }
 
 function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]$description) {
@@ -1654,6 +1822,24 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    $hasOtherSelector = [bool](
+        $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
+        $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly
+    )
+    $runTomlSuite = Test-ShouldRunTomlSuite `
+        -tomlOnly:$TomlOnly `
+        -hasOtherSelector:$hasOtherSelector
+    Test-TomlSuiteRoutingContract
+
+    if ($TomlOnly) {
+        Test-DiagnosticNormalization
+        if (-not $runTomlSuite) {
+            throw 'Internal routing error: -TomlOnly did not select the TOML regression suite'
+        }
+        Invoke-TomlBasicStringSuite
+        return
+    }
+
     if ($NoGitOnly) {
         foreach ($source in @('defaults', 'explicit')) {
             Test-PowerShellInitializationWithoutGit $source
@@ -1749,6 +1935,10 @@ try {
     }
 
     Test-DiagnosticNormalization
+
+    if ($runTomlSuite) {
+        Invoke-TomlBasicStringSuite
+    }
 
     Test-PowerShellDuplicateGitPathDiscovery
 
