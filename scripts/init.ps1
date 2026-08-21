@@ -390,6 +390,9 @@ $pendingDirectories.Push($repoRoot)
 while ($pendingDirectories.Count -gt 0) {
     $directory = $pendingDirectories.Pop()
     try {
+        # -Force keeps dot-prefixed and Hidden entries in the same inventory on
+        # every platform; Test-Excluded prunes VCS and build directories before
+        # any of their children can be inspected.
         $children = Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop
     } catch {
         throw "Could not traverse the complete repository tree at '$((Get-RelativeDisplayPath $directory))'; no files were changed: $($_.Exception.Message)"
