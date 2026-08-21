@@ -80,6 +80,12 @@ jobs:
             exit 1
           fi
 
+      # Checkout is the first point where repository identity can be inspected.
+      # Block the untouched or only-partly-initialized template before installing
+      # tools, changing release files, packaging, or publishing anything.
+      - name: Preflight — require initialized project
+        run: python3 tests/release-preflight/check_initialized.py .
+
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
 
       # Fail fast (in seconds) if the publish credential is missing — before the
