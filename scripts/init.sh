@@ -433,22 +433,27 @@ substitute_tokens() {
   substitute_trailing_lf=0
   [ "$substitute_last_byte" != 10 ] || substitute_trailing_lf=1
   TPL_TRAILING_LF="$substitute_trailing_lf" awk '
-    function repl(s, tok, val,   out, pos) {
+    BEGIN {
+      replacement["__ProjectName__"] = ENVIRON["TPL_PROJECT"]
+      replacement["__Author__"] = ENVIRON["TPL_AUTHOR"]
+      replacement["__AuthorEmail__"] = ENVIRON["TPL_AUTHOR_EMAIL"]
+      replacement["__GitHubOwner__"] = ENVIRON["TPL_OWNER"]
+      replacement["__Description__"] = ENVIRON["TPL_DESC"]
+      replacement["__Year__"] = ENVIRON["TPL_YEAR"]
+    }
+    function expand_original(s,   out, matched) {
       out = ""
-      while ((pos = index(s, tok)) > 0) {
-        out = out substr(s, 1, pos - 1) val
-        s = substr(s, pos + length(tok))
+      while (match(s, /__(ProjectName|Author|AuthorEmail|GitHubOwner|Description|Year)__/)) {
+        matched = substr(s, RSTART, RLENGTH)
+        out = out substr(s, 1, RSTART - 1) replacement[matched]
+        s = substr(s, RSTART + RLENGTH)
       }
       return out s
     }
     {
-      s = $0
-      s = repl(s, "__ProjectName__", ENVIRON["TPL_PROJECT"])
-      s = repl(s, "__Author__",      ENVIRON["TPL_AUTHOR"])
-      s = repl(s, "__AuthorEmail__", ENVIRON["TPL_AUTHOR_EMAIL"])
-      s = repl(s, "__GitHubOwner__", ENVIRON["TPL_OWNER"])
-      s = repl(s, "__Description__", ENVIRON["TPL_DESC"])
-      s = repl(s, "__Year__",        ENVIRON["TPL_YEAR"])
+      # Only the untouched source remainder is matched; appended replacement
+      # values are output data and can never become a second template pass.
+      s = expand_original($0)
       if (NR > 1) printf "\n"
       printf "%s", s
     }
