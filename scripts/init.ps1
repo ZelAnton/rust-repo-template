@@ -303,15 +303,25 @@ function New-ExclusiveDirectory([string]$path, [ref]$nativeError) {
     [RustTemplateInit.NativeDirectory]::TryCreate($path, $nativeError)
 }
 
-function Wait-ReservationCleanupCheckpoint([string]$relativeDestination) {
-    if (
-        $env:INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK -cne
-            $relativeDestination
-    ) {
+function Wait-ReservationCleanupCheckpoint(
+    [string]$relativeDestination,
+    [bool]$partialMarkerFailure
+) {
+    $heldDestination = if ($partialMarkerFailure) {
+        $env:INIT_SECURITY_TEST_HOLD_AFTER_PARTIAL_RESERVATION_MARKER_FAILURE
+    } else {
+        $env:INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK
+    }
+    if ($heldDestination -cne $relativeDestination) {
         return
     }
 
-    [Console]::Out.WriteLine('INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED')
+    $checkpoint = if ($partialMarkerFailure) {
+        'INITIALIZER_TEST_PARTIAL_RESERVATION_MARKER_FAILED'
+    } else {
+        'INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED'
+    }
+    [Console]::Out.WriteLine($checkpoint)
     if ($env:INIT_SECURITY_TEST_READY_FILE -and $env:INIT_SECURITY_TEST_RELEASE_FILE) {
         [IO.File]::WriteAllText($env:INIT_SECURITY_TEST_READY_FILE, 'ready')
         $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -324,6 +334,31 @@ function Wait-ReservationCleanupCheckpoint([string]$relativeDestination) {
     } elseif ([Console]::In.ReadLine() -cne 'continue') {
         throw 'Initializer reservation cleanup checkpoint was not released.'
     }
+}
+
+function Remove-EmptyOrdinaryDirectory([string]$path, [string]$description) {
+    # Keep the observable type/attribute/emptiness checks adjacent to the
+    # non-recursive delete. They reject replacements present at cleanup time;
+    # this path-based API is not an atomic identity guarantee against an
+    # adversarial replacement in the final check/delete window.
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if (
+        -not $item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    ) {
+        throw "$description is not an ordinary non-reparse directory"
+    }
+
+    $entries = [IO.Directory]::EnumerateFileSystemEntries($path).GetEnumerator()
+    try {
+        if ($entries.MoveNext()) {
+            throw "$description is not empty"
+        }
+    } finally {
+        $entries.Dispose()
+    }
+
+    [IO.Directory]::Delete($path, $false)
 }
 
 Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
@@ -467,14 +502,20 @@ foreach ($reservation in $reservations) {
             ) {
                 throw 'reservation ownership marker changed before cleanup'
             }
-            Wait-ReservationCleanupCheckpoint $reservation.RelativeDestination
-            [IO.Directory]::Delete($reservation.MarkerPath, $false)
+            Wait-ReservationCleanupCheckpoint $reservation.RelativeDestination $false
+            Remove-EmptyOrdinaryDirectory `
+                $reservation.MarkerPath `
+                'reservation ownership marker'
             if (Test-PathEntryExists $reservation.MarkerPath) {
                 throw 'reservation ownership marker still exists after cleanup'
             }
+        } else {
+            Wait-ReservationCleanupCheckpoint $reservation.RelativeDestination $true
         }
 
-        [IO.Directory]::Delete($reservation.Destination, $false)
+        Remove-EmptyOrdinaryDirectory `
+            $reservation.Destination `
+            'destination reservation'
         if (Test-PathEntryExists $reservation.Destination) {
             throw 'destination still exists after reservation cleanup'
         }

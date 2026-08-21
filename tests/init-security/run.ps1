@@ -742,30 +742,122 @@ function Test-PerDirectoryCaseSemantics(
 }
 
 function Test-PartialReservationMarkerFailure(
-    [ValidateSet('powershell', 'posix')][string]$kind
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('none', 'file', 'directory', 'link')][string]$replacementKind = 'none'
 ) {
-    $copyRoot = Join-Path $script:TempRoot "$kind-reservation-marker-failure"
+    $copyRoot = Join-Path `
+        $script:TempRoot `
+        "$kind-reservation-marker-failure-$replacementKind"
     Copy-Template -source $script:RepoRoot -destination $copyRoot
     $relativeSource = '.initializer-reservation-failure/a-__ProjectName__.txt'
     $relativeDestination = '.initializer-reservation-failure/a-init-security.txt'
     Add-TextFixture $copyRoot $relativeSource 'source must remain byte-identical'
     $before = Get-TreeFingerprint $copyRoot
+    $destination = Join-Path $copyRoot $relativeDestination
+    $externalContent = "external $replacementKind object must survive partial-marker cleanup"
+    $linkTarget = Join-Path `
+        $script:TempRoot `
+        "$kind-partial-reservation-link-target"
     $invocation = Get-InitializerInvocation `
         $kind $copyRoot 'Reservation Tester' 'reservation@example.com'
     $invocation.Environment['INIT_SECURITY_TEST_FAIL_RESERVATION_MARKER'] = $relativeDestination
-    $result = Invoke-CapturedProcess `
-        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    if ($replacementKind -eq 'none') {
+        $result = Invoke-CapturedProcess `
+            $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    } else {
+        $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PARTIAL_RESERVATION_MARKER_FAILURE'] = `
+            $relativeDestination
+        $result = Invoke-CapturedProcessAtCheckpoint `
+            $invocation.FileName `
+            $invocation.Arguments `
+            $copyRoot `
+            $invocation.Environment `
+            'INITIALIZER_TEST_PARTIAL_RESERVATION_MARKER_FAILED' `
+            {
+                [IO.Directory]::Delete($destination, $false)
+                switch ($replacementKind) {
+                    'file' {
+                        Add-TextFixture $copyRoot $relativeDestination $externalContent
+                    }
+                    'directory' {
+                        Add-DirectoryFixture $copyRoot $relativeDestination $externalContent
+                    }
+                    'link' {
+                        [void](New-Item -ItemType Directory -Path $linkTarget)
+                        Add-TextFixture $linkTarget 'marker.txt' $externalContent
+                        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+                        [void](New-Item -ItemType $linkType -Path $destination -Target $linkTarget)
+                    }
+                }
+            }
+
+        if (-not $result.CheckpointObserved) {
+            throw "$kind initializer did not expose the partial-reservation checkpoint.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+        }
+    }
 
     if ($result.ExitCode -eq 0) {
-        throw "$kind initializer accepted an injected ownership-marker failure"
+        throw "$kind initializer accepted an injected ownership-marker failure ($replacementKind)"
     }
     Assert-DiagnosticContains $result `
-        "destination '$relativeDestination' ownership marker could not be created after reservation" `
+        $relativeDestination `
         "$kind initializer returned an unclear partial-reservation diagnostic."
+
+    if ($replacementKind -eq 'none') {
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer stranded or mutated data after a partial reservation"
+        return
+    }
+
+    switch ($replacementKind) {
+        'file' {
+            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                throw "$kind initializer deleted the partial-reservation replacement file"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText($destination)) `
+                $externalContent `
+                "$kind initializer changed the partial-reservation replacement file"
+        }
+        'directory' {
+            $marker = Join-Path $destination 'marker.txt'
+            if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+                throw "$kind initializer deleted the partial-reservation replacement directory"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText($marker)) `
+                $externalContent `
+                "$kind initializer changed the partial-reservation replacement directory"
+        }
+        'link' {
+            $item = Get-Item -LiteralPath $destination -Force
+            if (-not $item.LinkType) {
+                throw "$kind initializer deleted the partial-reservation replacement link/reparse point"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText((Join-Path $linkTarget 'marker.txt'))) `
+                $externalContent `
+                "$kind initializer changed the partial-reservation replacement link target"
+        }
+    }
+
+    switch ($replacementKind) {
+        'file' { [IO.File]::Delete($destination) }
+        'directory' { [IO.Directory]::Delete($destination, $true) }
+        'link' {
+            if ($IsWindows) {
+                [IO.Directory]::Delete($destination, $false)
+            } else {
+                [IO.File]::Delete($destination)
+            }
+        }
+    }
     Assert-Equal `
         (Get-TreeFingerprint $copyRoot) `
         $before `
-        "$kind initializer stranded or mutated data after a partial reservation"
+        "$kind initializer mutated the template around a replaced partial reservation"
 }
 
 function Test-ReservationReplacementAfterOwnershipCheck(
@@ -1142,6 +1234,9 @@ try {
             Test-PerDirectoryCaseSemantics $kind
             Test-PartialReservationMarkerFailure $kind
             foreach ($replacementKind in @('file', 'directory', 'link')) {
+                Test-PartialReservationMarkerFailure $kind $replacementKind
+            }
+            foreach ($replacementKind in @('file', 'directory', 'link')) {
                 Test-ReservationReplacementAfterOwnershipCheck $kind $replacementKind
             }
             foreach ($operation in @('rename', 'settings')) {
@@ -1161,6 +1256,9 @@ try {
         Test-UnicodeCaseAliasDestinations $kind
         Test-PerDirectoryCaseSemantics $kind
         Test-PartialReservationMarkerFailure $kind
+        foreach ($replacementKind in @('file', 'directory', 'link')) {
+            Test-PartialReservationMarkerFailure $kind $replacementKind
+        }
         foreach ($replacementKind in @('file', 'directory', 'link')) {
             Test-ReservationReplacementAfterOwnershipCheck $kind $replacementKind
         }

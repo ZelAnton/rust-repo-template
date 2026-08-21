@@ -229,9 +229,9 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
   non-overwriting moves, but journal only operations proven completed by this
   initializer: a destination that appears after preflight must remain untouched
   even if its planned source disappeared. The harness verifies Unicode aliases,
-  available per-directory behavior, partial reservation creation, reservation
-  replacement after ownership checking, and source-disappeared races for both
-  path and settings moves.
+  available per-directory behavior, partial reservation creation and replacement
+  before cleanup, reservation replacement after ownership checking, and
+  source-disappeared races for both path and settings moves.
 
 ### 2026-08-20 — template-only initializer checks leaked downstream
 - **Symptom:** An initialized repo retained the initializer security CI step and

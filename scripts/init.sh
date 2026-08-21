@@ -349,6 +349,35 @@ reservation_marker_paths=()
 reservation_marker_created=()
 reservation_count=0
 
+wait_reservation_cleanup_checkpoint() {
+  checkpoint_relative="$1"
+  checkpoint_kind="$2"
+  if [ "$checkpoint_kind" = partial ]; then
+    checkpoint_held_destination="${INIT_SECURITY_TEST_HOLD_AFTER_PARTIAL_RESERVATION_MARKER_FAILURE:-}"
+    checkpoint_message=INITIALIZER_TEST_PARTIAL_RESERVATION_MARKER_FAILED
+  else
+    checkpoint_held_destination="${INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK:-}"
+    checkpoint_message=INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED
+  fi
+  if [ "$checkpoint_held_destination" != "$checkpoint_relative" ]; then
+    return 0
+  fi
+
+  printf '%s\n' "$checkpoint_message"
+  if [ -n "${INIT_SECURITY_TEST_READY_FILE:-}" ] &&
+     [ -n "${INIT_SECURITY_TEST_RELEASE_FILE:-}" ]; then
+    printf '%s' ready > "$INIT_SECURITY_TEST_READY_FILE"
+    checkpoint_waits=0
+    while ! entry_exists "$INIT_SECURITY_TEST_RELEASE_FILE"; do
+      ((checkpoint_waits < 1500)) || die "initializer reservation cleanup checkpoint was not released."
+      sleep 0.02
+      checkpoint_waits=$((checkpoint_waits + 1))
+    done
+  elif ! IFS= read -r checkpoint_release || [ "$checkpoint_release" != continue ]; then
+    die "initializer reservation cleanup checkpoint was not released."
+  fi
+}
+
 reserve_destination() {
   reservation_path="$1"
   reservation_relative="$2"
@@ -428,21 +457,7 @@ for ((i = 0; i < reservation_count; i++)); do
       continue
     fi
 
-    if [ "${INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK:-}" = "${reservation_relatives[i]}" ]; then
-      printf '%s\n' 'INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED'
-      if [ -n "${INIT_SECURITY_TEST_READY_FILE:-}" ] &&
-         [ -n "${INIT_SECURITY_TEST_RELEASE_FILE:-}" ]; then
-        printf '%s' ready > "$INIT_SECURITY_TEST_READY_FILE"
-        checkpoint_waits=0
-        while ! entry_exists "$INIT_SECURITY_TEST_RELEASE_FILE"; do
-          ((checkpoint_waits < 1500)) || die "initializer reservation cleanup checkpoint was not released."
-          sleep 0.02
-          checkpoint_waits=$((checkpoint_waits + 1))
-        done
-      elif ! IFS= read -r checkpoint_release || [ "$checkpoint_release" != continue ]; then
-        die "initializer reservation cleanup checkpoint was not released."
-      fi
-    fi
+    wait_reservation_cleanup_checkpoint "${reservation_relatives[i]}" owned
 
     if ! rmdir "${reservation_marker_paths[i]}"; then
       printf "error: could not clean destination reservation '%s' ownership marker; no template files were changed\n" \
@@ -450,6 +465,8 @@ for ((i = 0; i < reservation_count; i++)); do
       reservation_cleanup_failed=1
       continue
     fi
+  else
+    wait_reservation_cleanup_checkpoint "${reservation_relatives[i]}" partial
   fi
 
   if ! rmdir "${reservation_paths[i]}" || entry_exists "${reservation_paths[i]}"; then
