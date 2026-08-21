@@ -148,6 +148,168 @@ year_t="$(toml_escape "$year")"
 
 echo "==> Initializing template as '$crate_name'"
 
+entry_exists() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# Build every mutation plan before the first write. The arrays deliberately use
+# Bash 3-compatible indexed arrays so the initializer retains macOS support.
+content_files=()
+content_count=0
+while IFS= read -r -d '' file; do
+  case "$file" in
+    "$self"|"$sibling_ps1"|"$security_tests"/*) continue ;;
+  esac
+  content_files[content_count]="$file"
+  content_count=$((content_count + 1))
+done < <(
+  find "$repo_root" \
+    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
+    -o -type f -print0
+)
+
+# Keep the content and rename plans deterministic without relying on GNU
+# `sort -z`, which is absent from the default macOS toolchain.
+for ((i = 0; i < content_count; i++)); do
+  for ((j = i + 1; j < content_count; j++)); do
+    if [[ "${content_files[j]}" < "${content_files[i]}" ]]; then
+      swap="${content_files[i]}"
+      content_files[i]="${content_files[j]}"
+      content_files[j]="$swap"
+    fi
+  done
+done
+
+rename_sources=()
+rename_destinations=()
+rename_source_relatives=()
+rename_destination_relatives=()
+rename_depths=()
+rename_count=0
+while IFS= read -r -d '' item; do
+  dir="${item%/*}"
+  base="${item##*/}"
+  newbase="${base//__ProjectName__/$crate_name}"
+  source_relative="${item#"$repo_root"/}"
+  destination="$dir/$newbase"
+  destination_relative="${destination#"$repo_root"/}"
+  depth=0
+  depth_tail="$source_relative"
+  while [[ "$depth_tail" == */* ]]; do
+    depth_tail="${depth_tail#*/}"
+    depth=$((depth + 1))
+  done
+  rename_sources[rename_count]="$item"
+  rename_destinations[rename_count]="$destination"
+  rename_source_relatives[rename_count]="$source_relative"
+  rename_destination_relatives[rename_count]="$destination_relative"
+  rename_depths[rename_count]="$depth"
+  rename_count=$((rename_count + 1))
+done < <(
+  find "$repo_root" \
+    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
+    -o -name '*__ProjectName__*' -print0
+)
+
+# Deepest sources run first; equal-depth paths use lexical order. This mirrors
+# init.ps1 and prevents a parent rename from invalidating an unprocessed child.
+for ((i = 1; i < rename_count; i++)); do
+  key_source="${rename_sources[i]}"
+  key_destination="${rename_destinations[i]}"
+  key_source_relative="${rename_source_relatives[i]}"
+  key_destination_relative="${rename_destination_relatives[i]}"
+  key_depth="${rename_depths[i]}"
+  j=$((i - 1))
+  while ((j >= 0)); do
+    precedes=0
+    if ((key_depth > rename_depths[j])); then
+      precedes=1
+    elif ((key_depth == rename_depths[j])) && [[ "$key_source_relative" < "${rename_source_relatives[j]}" ]]; then
+      precedes=1
+    fi
+    ((precedes == 1)) || break
+    rename_sources[j + 1]="${rename_sources[j]}"
+    rename_destinations[j + 1]="${rename_destinations[j]}"
+    rename_source_relatives[j + 1]="${rename_source_relatives[j]}"
+    rename_destination_relatives[j + 1]="${rename_destination_relatives[j]}"
+    rename_depths[j + 1]="${rename_depths[j]}"
+    j=$((j - 1))
+  done
+  rename_sources[j + 1]="$key_source"
+  rename_destinations[j + 1]="$key_destination"
+  rename_source_relatives[j + 1]="$key_source_relative"
+  rename_destination_relatives[j + 1]="$key_destination_relative"
+  rename_depths[j + 1]="$key_depth"
+done
+
+claude_template="$repo_root/.claude/settings.json.template"
+claude_settings="$repo_root/.claude/settings.json"
+activate_claude_settings=0
+if entry_exists "$claude_template"; then
+  [ -f "$claude_template" ] || die "expected .claude/settings.json.template to be a file before initialization."
+  activate_claude_settings=1
+fi
+
+collision_messages=()
+planned_targets=()
+planned_target_sources=()
+collision_count=0
+planned_target_count=0
+for ((i = 0; i < rename_count; i++)); do
+  if entry_exists "${rename_destinations[i]}"; then
+    collision_messages+=("destination '${rename_destination_relatives[i]}' already exists (source '${rename_source_relatives[i]}')")
+    collision_count=$((collision_count + 1))
+  fi
+  for ((j = 0; j < planned_target_count; j++)); do
+    if [ "${planned_targets[j]}" = "${rename_destinations[i]}" ]; then
+      collision_messages+=("destination '${rename_destination_relatives[i]}' is planned by multiple sources: '${planned_target_sources[j]}', '${rename_source_relatives[i]}'")
+      collision_count=$((collision_count + 1))
+    fi
+  done
+  planned_targets[planned_target_count]="${rename_destinations[i]}"
+  planned_target_sources[planned_target_count]="${rename_source_relatives[i]}"
+  planned_target_count=$((planned_target_count + 1))
+done
+if ((activate_claude_settings == 1)); then
+  settings_source_relative="${claude_template#"$repo_root"/}"
+  settings_destination_relative="${claude_settings#"$repo_root"/}"
+  if entry_exists "$claude_settings"; then
+    collision_messages+=("destination '$settings_destination_relative' already exists (source '$settings_source_relative')")
+    collision_count=$((collision_count + 1))
+  fi
+  for ((j = 0; j < planned_target_count; j++)); do
+    if [ "${planned_targets[j]}" = "$claude_settings" ]; then
+      collision_messages+=("destination '$settings_destination_relative' is planned by multiple sources: '${planned_target_sources[j]}', '$settings_source_relative'")
+      collision_count=$((collision_count + 1))
+    fi
+  done
+fi
+
+if ((collision_count > 0)); then
+  printf '%s\n' 'error: initialization collision preflight failed; no files were changed:' >&2
+  for message in "${collision_messages[@]}"; do
+    printf '  %s\n' "$message" >&2
+  done
+  exit 1
+fi
+
+# Validate the template-only content edit during preflight, not after earlier
+# token replacements. The same checked transform is executed below.
+if ! awk '
+  /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
+    if (inside || seen) exit 42
+    inside = 1
+    seen = 1
+    next
+  }
+  /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
+    if (!inside) exit 42
+    inside = 0
+    next
+  }
+  END { if (inside || seen != 1) exit 42 }
+' "$ci_workflow" > /dev/null; then
+  die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
+fi
+
 # Literal, backslash-safe token replacement. The source text and the six values
 # are passed through the environment because awk's ENVIRON does NO escape
 # processing — unlike bash's `${var//pat/repl}`, which collapses the doubled
@@ -181,10 +343,8 @@ substitute_tokens() {
 #    the literal token strings as search keys, so substituting inside them would
 #    corrupt the sibling script.
 changed=0
-while IFS= read -r -d '' file; do
-  case "$file" in
-    "$self"|"$sibling_ps1"|"$security_tests"/*) continue ;;
-  esac
+for ((i = 0; i < content_count; i++)); do
+  file="${content_files[i]}"
   case "$file" in
     *.toml) c=$crate_t; a=$author_t; ae=$author_email_t; o=$owner_t; d=$desc_t; y=$year_t ;;
     *)      c=$crate_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
@@ -202,7 +362,7 @@ while IFS= read -r -d '' file; do
     printf '%s' "$new" > "$file"
     changed=$((changed + 1))
   fi
-done < <(find "$repo_root" -type d \( -name .git -o -name .jj -o -name target \) -prune -o -type f -print0)
+done
 echo "    Updated contents in $changed file(s)."
 
 # The security harness tests the template's initializer implementation. It is
@@ -229,26 +389,28 @@ if ! awk '
 fi
 mv -f "$ci_without_template_step" "$ci_workflow"
 
-# 2) Rename files and folders whose name contains the crate-name token. -depth
-#    processes children before parents so a renamed dir doesn't invalidate paths.
-#    (None in the single-crate skeleton; supports `crates/__ProjectName__` etc.)
-while IFS= read -r -d '' item; do
-  case "$item" in
-    */.git/*|*/.jj/*|*/target/*) continue ;;
-  esac
-  dir="$(dirname "$item")"
-  base="$(basename "$item")"
-  newbase="${base//__ProjectName__/$crate_name}"
-  if [ "$newbase" != "$base" ]; then
-    mv "$item" "$dir/$newbase"
-    echo "    Renamed $base -> $newbase"
+# 2) Execute the already validated one-to-one rename plan without overwrite.
+for ((i = 0; i < rename_count; i++)); do
+  if entry_exists "${rename_destinations[i]}"; then
+    die "destination '${rename_destination_relatives[i]}' appeared after preflight; refusing to rename source '${rename_source_relatives[i]}'."
   fi
-done < <(find "$repo_root" -depth -name '*__ProjectName__*' -print0)
+  mv -n "${rename_sources[i]}" "${rename_destinations[i]}"
+  if entry_exists "${rename_sources[i]}"; then
+    die "non-overwriting rename refused destination '${rename_destination_relatives[i]}' for source '${rename_source_relatives[i]}'."
+  fi
+  echo "    Renamed ${rename_sources[i]##*/} -> ${rename_destinations[i]##*/}"
+done
 
 # 3) Activate Claude Code shared settings from the shipped .template (renames
 #    .claude/settings.json.template -> .claude/settings.json).
-if [ -f "$repo_root/.claude/settings.json.template" ]; then
-  mv -f "$repo_root/.claude/settings.json.template" "$repo_root/.claude/settings.json"
+if ((activate_claude_settings == 1)); then
+  if entry_exists "$claude_settings"; then
+    die "destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
+  fi
+  mv -n "$claude_template" "$claude_settings"
+  if entry_exists "$claude_template"; then
+    die "non-overwriting settings activation refused destination '.claude/settings.json'."
+  fi
   echo "    Activated .claude/settings.json"
 fi
 

@@ -81,7 +81,8 @@ Confirm these facts by reading, not by assuming:
 
    The crate name is required; the rest fall back to sensible defaults. The
    script substitutes tokens (TOML-escaped for `Cargo.toml`), renames any
-   token-named files/folders, and deletes `TEMPLATE.md`,
+   token-named files/folders, refuses all path/settings collisions before its
+   first write, and deletes `TEMPLATE.md`,
    `docs/AGENT-INIT-GUIDE.md`, the template-only initializer security harness
    and its CI step, and both initializers (unless `-KeepScript` /
    `--keep-script`). Run **one** initializer, not both.
@@ -205,6 +206,20 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-08-21 — initializer collisions could overwrite or partially mutate a checkout
+- **Symptom:** A token-named file could replace an existing file on POSIX, a
+  token-named directory could be moved *inside* an existing directory, and an
+  existing `.claude/settings.json` was overwritten. PowerShell often failed on
+  the same collisions only after content replacement had already started.
+- **Root cause:** Renames and shared-settings activation were executed without a
+  complete destination plan; collision discovery was delegated to differing
+  shell move semantics after earlier mutations.
+- **Rule:** Both initializers preflight every token-path rename and settings
+  activation before the first write, report all conflicting source→destination
+  mappings together, and execute the validated plan with non-overwriting moves.
+  Treat any failed initializer as atomic: file bytes, names, and directories
+  must match the pre-run tree exactly.
 
 ### 2026-08-20 — template-only initializer checks leaked downstream
 - **Symptom:** An initialized repo retained the initializer security CI step and

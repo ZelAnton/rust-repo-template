@@ -254,20 +254,106 @@ function Test-Excluded([string]$fullPath) {
     return $false
 }
 
+function Test-PathEntryExists([string]$path) {
+    try {
+        [void](Get-Item -LiteralPath $path -Force -ErrorAction Stop)
+        return $true
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $false
+    }
+}
+
+function Get-RelativeDisplayPath([string]$path) {
+    [IO.Path]::GetRelativePath($repoRoot, [IO.Path]::GetFullPath($path)).Replace('\', '/')
+}
+
 Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the literal token strings as search keys, so substituting inside them would
-#    corrupt the sibling script.
+# Build every mutation plan before the first write. In particular, a path
+# collision must not be discovered after content replacement has already
+# changed the user's checkout.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+
+# Deepest paths run first so child renames do not invalidate parent sources.
+# Ordinal relative-path ordering makes equal-depth plans reproducible.
+$renamePlan = [Collections.Generic.List[object]]::new()
+foreach ($item in (Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
+    -not (Test-Excluded $_.FullName) -and $_.Name.Contains('__ProjectName__')
+})) {
+    $relativeSource = Get-RelativeDisplayPath $item.FullName
+    $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
+    $destination = Join-Path (Split-Path -Parent $item.FullName) $newName
+    $renamePlan.Add([pscustomobject]@{
+        Source = $item.FullName
+        Destination = $destination
+        RelativeSource = $relativeSource
+        RelativeDestination = Get-RelativeDisplayPath $destination
+        Depth = ($relativeSource.ToCharArray() | Where-Object { $_ -eq '/' }).Count
+        OriginalName = $item.Name
+        NewName = $newName
+    })
+}
+$renamePlan.Sort([Comparison[object]]{
+    param($left, $right)
+    $depthOrder = $right.Depth.CompareTo($left.Depth)
+    if ($depthOrder -ne 0) { return $depthOrder }
+    return [StringComparer]::Ordinal.Compare($left.RelativeSource, $right.RelativeSource)
+})
+
+$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
+$claudeSettings = Join-Path $repoRoot '.claude/settings.json'
+$activateClaudeSettings = Test-PathEntryExists $claudeTemplate
+if ($activateClaudeSettings -and -not (Test-Path -LiteralPath $claudeTemplate -PathType Leaf)) {
+    throw "Expected .claude/settings.json.template to be a file before initialization."
+}
+
+$collisions = [Collections.Generic.List[string]]::new()
+$targetComparer = if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }
+$plannedTargets = [Collections.Generic.Dictionary[string, Collections.Generic.List[string]]]::new($targetComparer)
+
+foreach ($entry in $renamePlan) {
+    if (Test-PathEntryExists $entry.Destination) {
+        $collisions.Add("destination '$($entry.RelativeDestination)' already exists (source '$($entry.RelativeSource)')")
+    }
+    if (-not $plannedTargets.ContainsKey($entry.Destination)) {
+        $plannedTargets[$entry.Destination] = [Collections.Generic.List[string]]::new()
+    }
+    $plannedTargets[$entry.Destination].Add($entry.RelativeSource)
+}
+if ($activateClaudeSettings) {
+    $settingsSource = Get-RelativeDisplayPath $claudeTemplate
+    $settingsDestination = Get-RelativeDisplayPath $claudeSettings
+    if (Test-PathEntryExists $claudeSettings) {
+        $collisions.Add("destination '$settingsDestination' already exists (source '$settingsSource')")
+    }
+    if (-not $plannedTargets.ContainsKey($claudeSettings)) {
+        $plannedTargets[$claudeSettings] = [Collections.Generic.List[string]]::new()
+    }
+    $plannedTargets[$claudeSettings].Add($settingsSource)
+}
+foreach ($target in $plannedTargets.Keys) {
+    $sources = $plannedTargets[$target]
+    if ($sources.Count -gt 1) {
+        $displayTarget = Get-RelativeDisplayPath $target
+        $displaySources = ($sources | ForEach-Object { "'$_'" }) -join ', '
+        $collisions.Add("destination '$displayTarget' is planned by multiple sources: $displaySources")
+    }
+}
+if ($collisions.Count -gt 0) {
+    throw "initialization collision preflight failed; no files were changed:`n  $($collisions -join "`n  ")"
+}
+
+# Validate and materialize the content plan only in memory. Any malformed
+# template-only CI markers or unreadable file still fail before the first write.
 $files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
     -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
 }
-$contentChanged = 0
+$contentPlan = [Collections.Generic.List[object]]::new()
 foreach ($file in $files) {
     $text = [System.IO.File]::ReadAllText($file.FullName)
     $new = $text
-    $map = if ([IO.Path]::GetFullPath($file.FullName) -eq $releaseWorkflowPath) {
+    $canonicalFile = [IO.Path]::GetFullPath($file.FullName)
+    $map = if ($canonicalFile.Equals($releaseWorkflowPath, $pathComparison)) {
         $releaseWorkflowReplacements
     } elseif ($tomlFileExtensions -contains $file.Extension) {
         $tomlReplacements
@@ -277,39 +363,45 @@ foreach ($file in $files) {
     foreach ($key in $map.Keys) {
         $new = $new.Replace($key, $map[$key])
     }
-    if ([IO.Path]::GetFullPath($file.FullName) -eq $ciWorkflowPath) {
+    if ($canonicalFile.Equals($ciWorkflowPath, $pathComparison)) {
         $templateOnlyMatches = $templateOnlyCiPattern.Matches($new)
         if ($templateOnlyMatches.Count -ne 1) {
             throw "Expected exactly one template-only init-security block in .github/workflows/ci.yml; found $($templateOnlyMatches.Count)."
         }
         $new = $templateOnlyCiPattern.Replace($new, '', 1)
     }
-    if ($new -ne $text) {
-        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-        [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
-        $contentChanged++
+    if ($new -cne $text) {
+        $contentPlan.Add([pscustomobject]@{
+            Path = $file.FullName
+            Content = $new
+        })
     }
 }
-Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
 
-# 2) Rename files and folders whose name contains the crate-name token.
-#    Deepest paths first so child renames don't invalidate parent paths.
-#    (The single-crate skeleton has none, but workspace adaptations may add
-#    `crates/__ProjectName__` etc., so support it.)
-$named = Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
-} | Sort-Object { $_.FullName.Length } -Descending
-foreach ($item in $named) {
-    $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
-    Rename-Item -LiteralPath $item.FullName -NewName $newName
-    Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
+# 1) Replace tokens in file contents. Both initializers are skipped: they carry
+#    the literal token strings as search keys, so substituting inside them would
+#    corrupt the sibling script.
+foreach ($entry in $contentPlan) {
+    # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
+    [System.IO.File]::WriteAllText($entry.Path, $entry.Content, (New-Object System.Text.UTF8Encoding($false)))
+}
+Write-Host "    Updated contents in $($contentPlan.Count) file(s)." -ForegroundColor DarkGray
+
+# 2) Execute the already validated one-to-one rename plan without overwrite.
+foreach ($entry in $renamePlan) {
+    if (Test-PathEntryExists $entry.Destination) {
+        throw "Destination '$($entry.RelativeDestination)' appeared after preflight; refusing to rename source '$($entry.RelativeSource)'."
+    }
+    Rename-Item -LiteralPath $entry.Source -NewName $entry.NewName -ErrorAction Stop
+    Write-Host "    Renamed $($entry.OriginalName) -> $($entry.NewName)" -ForegroundColor DarkGray
 }
 
-# 3) Activate Claude Code shared settings from the shipped .template (renames
-#    .claude/settings.json.template -> .claude/settings.json).
-$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
+# 3) Activate Claude Code shared settings without overwrite.
+if ($activateClaudeSettings) {
+    if (Test-PathEntryExists $claudeSettings) {
+        throw "Destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
+    }
+    Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
     Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
 }
 

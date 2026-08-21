@@ -1,6 +1,8 @@
 #!/usr/bin/env pwsh
 [CmdletBinding()]
-param()
+param(
+    [switch]$CollisionOnly
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -123,7 +125,7 @@ function Copy-Template([string]$source, [string]$destination) {
 }
 
 function Get-TreeFingerprint([string]$root) {
-    $entries = Get-ChildItem -LiteralPath $root -File -Recurse -Force |
+    $entries = Get-ChildItem -LiteralPath $root -Recurse -Force |
         Where-Object {
             $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
             $relative -notmatch '(^|[\\/])\.(git|jj)([\\/]|$)'
@@ -131,9 +133,34 @@ function Get-TreeFingerprint([string]$root) {
         Sort-Object FullName |
         ForEach-Object {
             $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
-            "$relative=$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+            if ($_.LinkType) {
+                "link:$relative=$($_.Target -join ',')"
+            } elseif ($_.PSIsContainer) {
+                "directory:$relative"
+            } else {
+                "file:$relative=$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+            }
         }
     $entries -join "`n"
+}
+
+function Add-TextFixture([string]$root, [string]$relativePath, [string]$content) {
+    $path = Join-Path $root $relativePath
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) {
+        [void](New-Item -ItemType Directory -Path $parent -Force)
+    }
+    [IO.File]::WriteAllText($path, $content, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Add-DirectoryFixture([string]$root, [string]$relativePath, [string]$marker) {
+    $path = Join-Path $root $relativePath
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) {
+        [void](New-Item -ItemType Directory -Path $parent -Force)
+    }
+    [void](New-Item -ItemType Directory -Path $path)
+    Add-TextFixture $path 'marker.txt' $marker
 }
 
 function Get-InitializerInvocation(
@@ -240,17 +267,50 @@ function Assert-HiddenInitializerFixtureUpdated([string]$copyRoot, [string]$desc
         "$description did not replace content inside a hidden directory"
 }
 
+function Add-NestedRenameFixture([string]$copyRoot) {
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-rename-fixture/__ProjectName__-parent/__ProjectName__-child.txt' `
+        '__Description__'
+}
+
+function Assert-NestedRenameFixtureUpdated([string]$copyRoot, [string]$description) {
+    $renamedPath = Join-Path $copyRoot `
+        '.initializer-rename-fixture/init-security-parent/init-security-child.txt'
+    if (-not (Test-Path -LiteralPath $renamedPath -PathType Leaf)) {
+        throw "$description did not execute nested token-path renames one-to-one"
+    }
+    Assert-Equal `
+        ([IO.File]::ReadAllText($renamedPath)) `
+        'Initializer security regression fixture' `
+        "$description did not update content before nested token-path renames"
+    foreach ($stalePath in @(
+        '.initializer-rename-fixture/__ProjectName__-parent',
+        '.initializer-rename-fixture/init-security-parent/__ProjectName__-child.txt'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $copyRoot $stalePath)) {
+            throw "$description retained stale nested token path $stalePath"
+        }
+    }
+}
+
 function Test-SuccessfulInitialization(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('explicit', 'git-config')][string]$source,
     [string]$caseName,
     [string]$author,
     [string]$authorEmail,
-    [bool]$KeepScript = $true
+    [bool]$KeepScript = $true,
+    [bool]$AddRenameFixtures = $true
 ) {
     $copyRoot = Join-Path $script:TempRoot "$kind-$source-$caseName"
     Copy-Template -source $script:RepoRoot -destination $copyRoot
-    Add-HiddenInitializerFixture $copyRoot
+    if ($AddRenameFixtures) {
+        Add-HiddenInitializerFixture $copyRoot
+        Add-NestedRenameFixture $copyRoot
+    }
+    $settingsTemplate = Join-Path $copyRoot '.claude/settings.json.template'
+    $expectedSettingsHash = (Get-FileHash -LiteralPath $settingsTemplate -Algorithm SHA256).Hash
     $useDefaults = $source -eq 'git-config'
     if ($useDefaults) {
         $init = Invoke-CapturedProcess 'git' @('init', '-q') $copyRoot
@@ -271,7 +331,21 @@ function Test-SuccessfulInitialization(
     $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
     Assert-ProcessSucceeded $result "$kind initializer ($source $caseName)"
     Assert-TemplateOnlySecurityArtifactsRemoved $copyRoot "$kind initializer ($source $caseName)"
-    Assert-HiddenInitializerFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+    if ($AddRenameFixtures) {
+        Assert-HiddenInitializerFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+        Assert-NestedRenameFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+    }
+    $settingsPath = Join-Path $copyRoot '.claude/settings.json'
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        throw "$kind initializer ($source $caseName) did not activate .claude/settings.json"
+    }
+    if (Test-Path -LiteralPath $settingsTemplate) {
+        throw "$kind initializer ($source $caseName) retained .claude/settings.json.template"
+    }
+    Assert-Equal `
+        ((Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash) `
+        $expectedSettingsHash `
+        "$kind initializer ($source $caseName) changed shared settings during activation"
 
     foreach ($initializer in @('scripts/init.ps1', 'scripts/init.sh')) {
         $exists = Test-Path -LiteralPath (Join-Path $copyRoot $initializer)
@@ -299,6 +373,99 @@ function Test-SuccessfulInitialization(
     Assert-ProcessSucceeded $verification "$kind generated workflow verification ($source $caseName)"
 
     [IO.File]::ReadAllText((Join-Path $copyRoot '.github/workflows/release.yml'))
+}
+
+function Test-CollisionFailure(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [string]$caseName,
+    [scriptblock]$arrange,
+    [string[]]$expectedDiagnostics
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-collision-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    & $arrange $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Collision Tester' 'collision@example.com'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted the $caseName collision fixture"
+    }
+    Assert-DiagnosticContains $result `
+        'initialization collision preflight failed; no files were changed' `
+        "$kind initializer returned an unclear preflight diagnostic for $caseName."
+    foreach ($expected in $expectedDiagnostics) {
+        Assert-DiagnosticContains $result $expected `
+            "$kind initializer omitted a source-to-destination collision for $caseName."
+    }
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer changed file bytes or tree structure after rejecting $caseName"
+}
+
+function Test-CollisionMatrix([ValidateSet('powershell', 'posix')][string]$kind) {
+    Test-CollisionFailure $kind 'file-to-file' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/file-__ProjectName__.txt' 'source __Description__'
+        Add-TextFixture $root '.initializer-collisions/file-init-security.txt' 'destination must survive'
+    } @(
+        "destination '.initializer-collisions/file-init-security.txt' already exists (source '.initializer-collisions/file-__ProjectName__.txt')"
+    )
+
+    Test-CollisionFailure $kind 'directory-to-directory' {
+        param($root)
+        Add-DirectoryFixture $root '.initializer-collisions/directory-__ProjectName__' 'source directory'
+        Add-DirectoryFixture $root '.initializer-collisions/directory-init-security' 'destination directory'
+    } @(
+        "destination '.initializer-collisions/directory-init-security' already exists (source '.initializer-collisions/directory-__ProjectName__')"
+    )
+
+    Test-CollisionFailure $kind 'file-to-directory' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/mixed-__ProjectName__' 'source file'
+        Add-DirectoryFixture $root '.initializer-collisions/mixed-init-security' 'destination directory'
+    } @(
+        "destination '.initializer-collisions/mixed-init-security' already exists (source '.initializer-collisions/mixed-__ProjectName__')"
+    )
+
+    Test-CollisionFailure $kind 'directory-to-file' {
+        param($root)
+        Add-DirectoryFixture $root '.initializer-collisions/mixed-__ProjectName__' 'source directory'
+        Add-TextFixture $root '.initializer-collisions/mixed-init-security' 'destination file'
+    } @(
+        "destination '.initializer-collisions/mixed-init-security' already exists (source '.initializer-collisions/mixed-__ProjectName__')"
+    )
+
+    Test-CollisionFailure $kind 'settings' {
+        param($root)
+        Add-TextFixture $root '.claude/settings.json' 'existing settings must survive'
+    } @(
+        "destination '.claude/settings.json' already exists (source '.claude/settings.json.template')"
+    )
+
+    Test-CollisionFailure $kind 'multiple' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/first-__ProjectName__.txt' 'first source __Description__'
+        Add-TextFixture $root '.initializer-collisions/first-init-security.txt' 'first destination'
+        Add-DirectoryFixture $root '.initializer-collisions/second-__ProjectName__' 'second source'
+        Add-DirectoryFixture $root '.initializer-collisions/second-init-security' 'second destination'
+        Add-TextFixture $root '.claude/settings.json' 'existing settings'
+    } @(
+        "destination '.initializer-collisions/first-init-security.txt' already exists (source '.initializer-collisions/first-__ProjectName__.txt')",
+        "destination '.initializer-collisions/second-init-security' already exists (source '.initializer-collisions/second-__ProjectName__')",
+        "destination '.claude/settings.json' already exists (source '.claude/settings.json.template')"
+    )
+
+    Test-CollisionFailure $kind 'duplicate-planned-destination' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/__ProjectName__init-security.txt' 'first planned source'
+        Add-TextFixture $root '.initializer-collisions/init-security__ProjectName__.txt' 'second planned source'
+    } @(
+        "destination '.initializer-collisions/init-securityinit-security.txt' is planned by multiple sources: '.initializer-collisions/__ProjectName__init-security.txt', '.initializer-collisions/init-security__ProjectName__.txt'"
+    )
 }
 
 function Test-RejectedLineBreak(
@@ -429,12 +596,26 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-CollisionMatrix $kind
+    }
+    Write-Host 'Initializer collision preflight checks passed.' -ForegroundColor Green
+    if ($CollisionOnly) {
+        return
+    }
+
     Test-DiagnosticNormalization
 
     $ordinaryAuthor = 'Renée  O''Connor, "R&D" + QA'
     $ordinaryEmail = 'anne.o+release@example.com'
     $hostileAuthor = 'Eve "$(touch$IFS./init-security-name-owned)" #:[]{}&*!| suffix'
     $hostileEmail = 'attacker+$(touch$IFS./init-security-email-owned)@example.com'
+
+    $psPlain = Test-SuccessfulInitialization powershell explicit plain-template `
+        $ordinaryAuthor $ordinaryEmail -AddRenameFixtures:$false
+    $shPlain = Test-SuccessfulInitialization posix explicit plain-template `
+        $ordinaryAuthor $ordinaryEmail -AddRenameFixtures:$false
+    Assert-Equal $shPlain $psPlain 'Initializers generated different plain-template release workflows'
 
     $psOrdinary = Test-SuccessfulInitialization powershell explicit ordinary $ordinaryAuthor $ordinaryEmail
     $shOrdinary = Test-SuccessfulInitialization posix explicit ordinary $ordinaryAuthor $ordinaryEmail
