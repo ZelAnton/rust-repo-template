@@ -13,6 +13,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("extract_release_notes.py")
 WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "release.yml"
+PREFLIGHT_TEST = Path(__file__).parents[1] / "release-preflight" / "test_check_initialized.py"
 SPEC = importlib.util.spec_from_file_location("extract_release_notes", SCRIPT)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"could not load {SCRIPT}")
@@ -47,6 +48,15 @@ def workflow_run_script(step_name: str) -> str:
 
 
 class ExtractReleaseNotesTests(unittest.TestCase):
+    def test_release_initialization_preflight_regressions(self) -> None:
+        result = subprocess.run(
+            [sys.executable, str(PREFLIGHT_TEST)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_exact_markdown_matrix(self) -> None:
         cases = [
             (
