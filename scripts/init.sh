@@ -152,6 +152,19 @@ entry_exists() { [ -e "$1" ] || [ -L "$1" ]; }
 
 transaction_dir="$(mktemp -d "${TMPDIR:-/tmp}/rust-template-init.XXXXXX")" ||
   die "could not create initializer transaction directory."
+
+# A content source is safe to open through its repository path only while it is
+# a regular non-symlink with exactly one hard link. Re-run this observable
+# contract immediately before every content write and rollback restore; the
+# initial inventory alone cannot protect against a post-preflight substitution.
+ordinary_file() {
+  ordinary_path="$1"
+  ordinary_probe="$transaction_dir/ordinary-file-probe"
+  [ ! -L "$ordinary_path" ] && [ -f "$ordinary_path" ] || return 1
+  find "$ordinary_path" -prune -links 1 -print > "$ordinary_probe" || return 1
+  [ -s "$ordinary_probe" ]
+}
+
 transaction_active=0
 transaction_committed=0
 completed_rename_indices=()
@@ -161,6 +174,7 @@ content_plan_files=()
 content_plan_originals=()
 content_plan_updates=()
 content_plan_count=0
+completed_content_count=0
 
 rollback_transaction() {
   rollback_failed=0
@@ -192,8 +206,9 @@ rollback_transaction() {
     fi
   done
 
-  for ((rollback_i = 0; rollback_i < content_plan_count; rollback_i++)); do
-    if ! cp "${content_plan_originals[rollback_i]}" "${content_plan_files[rollback_i]}"; then
+  for ((rollback_i = 0; rollback_i < completed_content_count; rollback_i++)); do
+    if ! ordinary_file "${content_plan_files[rollback_i]}" ||
+       ! cp "${content_plan_originals[rollback_i]}" "${content_plan_files[rollback_i]}"; then
       printf "error: rollback could not restore content '%s'\n" \
         "${content_plan_files[rollback_i]#"$repo_root"/}" >&2
       rollback_failed=1
@@ -221,31 +236,97 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Build every mutation plan before the first write. The arrays deliberately use
-# Bash 3-compatible indexed arrays so the initializer retains macOS support.
-content_manifest="$transaction_dir/content-files"
-if [ "${INIT_SECURITY_TEST_FAIL_TRAVERSAL:-}" = content ]; then
-  printf '%s\0' "$repo_root/Cargo.toml" > "$content_manifest"
-  content_find_status=73
+# Build and validate one complete inventory before any repository mutation. The
+# arrays deliberately use Bash 3-compatible indexed arrays so the initializer
+# retains macOS support. find does not follow links; each link and non-regular
+# entry is rejected before any target path is opened.
+inventory_manifest="$transaction_dir/repository-entries"
+traversal_failure="${INIT_SECURITY_TEST_FAIL_TRAVERSAL:-}"
+if [ "$traversal_failure" = content ] || [ "$traversal_failure" = rename ]; then
+  printf '%s\0' "$repo_root/Cargo.toml" > "$inventory_manifest"
+  inventory_find_status=73
 elif find "$repo_root" \
     \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
-    -o -type f -print0 > "$content_manifest"; then
-  content_find_status=0
+    -o -print0 > "$inventory_manifest"; then
+  inventory_find_status=0
 else
-  content_find_status=$?
+  inventory_find_status=$?
 fi
-if ((content_find_status != 0)); then
-  die "could not traverse the complete repository content tree; no files were changed."
+if ((inventory_find_status != 0)); then
+  if [ "$traversal_failure" = content ] || [ "$traversal_failure" = rename ]; then
+    die "could not traverse the complete repository $traversal_failure tree; no files were changed."
+  fi
+  die "could not traverse the complete repository input tree; no files were changed."
 fi
+
 content_files=()
 content_count=0
-while IFS= read -r -d '' file; do
-  case "$file" in
-    "$self"|"$sibling_ps1"|"$security_tests"/*) continue ;;
+rename_sources=()
+rename_destinations=()
+rename_source_relatives=()
+rename_destination_relatives=()
+rename_depths=()
+rename_count=0
+unsafe_messages=()
+unsafe_count=0
+while IFS= read -r -d '' item; do
+  [ "$item" != "$repo_root" ] || continue
+  source_relative="${item#"$repo_root"/}"
+  if [ -L "$item" ]; then
+    unsafe_messages+=("'$source_relative' is a link or reparse point")
+    unsafe_count=$((unsafe_count + 1))
+    continue
+  elif [ -d "$item" ]; then
+    :
+  elif [ -f "$item" ]; then
+    if ! ordinary_file "$item"; then
+      unsafe_messages+=("'$source_relative' is a link or reparse point")
+      unsafe_count=$((unsafe_count + 1))
+      continue
+    fi
+    case "$item" in
+      "$self"|"$sibling_ps1") ;;
+      *)
+        content_files[content_count]="$item"
+        content_count=$((content_count + 1))
+        ;;
+    esac
+  else
+    unsafe_messages+=("'$source_relative' is not a regular file or directory")
+    unsafe_count=$((unsafe_count + 1))
+    continue
+  fi
+
+  base="${item##*/}"
+  case "$base" in
+    *__ProjectName__*)
+      dir="${item%/*}"
+      newbase="${base//__ProjectName__/$crate_name}"
+      destination="$dir/$newbase"
+      destination_relative="${destination#"$repo_root"/}"
+      depth=0
+      depth_tail="$source_relative"
+      while [[ "$depth_tail" == */* ]]; do
+        depth_tail="${depth_tail#*/}"
+        depth=$((depth + 1))
+      done
+      rename_sources[rename_count]="$item"
+      rename_destinations[rename_count]="$destination"
+      rename_source_relatives[rename_count]="$source_relative"
+      rename_destination_relatives[rename_count]="$destination_relative"
+      rename_depths[rename_count]="$depth"
+      rename_count=$((rename_count + 1))
+      ;;
   esac
-  content_files[content_count]="$file"
-  content_count=$((content_count + 1))
-done < "$content_manifest"
+done < "$inventory_manifest"
+
+if ((unsafe_count > 0)); then
+  printf '%s\n' 'error: initialization input preflight rejected unsafe filesystem entries; no files were changed:' >&2
+  for message in "${unsafe_messages[@]}"; do
+    printf '  %s\n' "$message" >&2
+  done
+  exit 1
+fi
 
 # Keep the content and rename plans deterministic without relying on GNU
 # `sort -z`, which is absent from the default macOS toolchain.
@@ -258,47 +339,6 @@ for ((i = 0; i < content_count; i++)); do
     fi
   done
 done
-
-rename_sources=()
-rename_destinations=()
-rename_source_relatives=()
-rename_destination_relatives=()
-rename_depths=()
-rename_count=0
-rename_manifest="$transaction_dir/rename-sources"
-if [ "${INIT_SECURITY_TEST_FAIL_TRAVERSAL:-}" = rename ]; then
-  printf '%s\0' "$repo_root/Cargo.toml" > "$rename_manifest"
-  rename_find_status=73
-elif find "$repo_root" \
-    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
-    -o -name '*__ProjectName__*' -print0 > "$rename_manifest"; then
-  rename_find_status=0
-else
-  rename_find_status=$?
-fi
-if ((rename_find_status != 0)); then
-  die "could not traverse the complete repository rename tree; no files were changed."
-fi
-while IFS= read -r -d '' item; do
-  dir="${item%/*}"
-  base="${item##*/}"
-  newbase="${base//__ProjectName__/$crate_name}"
-  source_relative="${item#"$repo_root"/}"
-  destination="$dir/$newbase"
-  destination_relative="${destination#"$repo_root"/}"
-  depth=0
-  depth_tail="$source_relative"
-  while [[ "$depth_tail" == */* ]]; do
-    depth_tail="${depth_tail#*/}"
-    depth=$((depth + 1))
-  done
-  rename_sources[rename_count]="$item"
-  rename_destinations[rename_count]="$destination"
-  rename_source_relatives[rename_count]="$source_relative"
-  rename_destination_relatives[rename_count]="$destination_relative"
-  rename_depths[rename_count]="$depth"
-  rename_count=$((rename_count + 1))
-done < "$rename_manifest"
 
 # Deepest sources run first; equal-depth paths use lexical order. This mirrors
 # init.ps1 and prevents a parent rename from invalidating an unprocessed child.
@@ -338,6 +378,139 @@ if entry_exists "$claude_template"; then
   [ -f "$claude_template" ] || die "expected .claude/settings.json.template to be a file before initialization."
   activate_claude_settings=1
 fi
+
+# Both initializers use the same byte-level contract: only ordinary files that
+# are valid UTF-8 and contain no NUL byte are eligible for token replacement.
+# Binary (NUL-containing) and unsupported (invalid UTF-8) regular files remain
+# byte-for-byte unchanged. Required template control files must be supported so
+# initialization cannot silently produce a broken repository.
+command -v iconv > /dev/null 2>&1 ||
+  die "iconv is required to classify UTF-8 template files; no files were changed."
+
+# The source file is read by awk through stdin. Only the small replacement map
+# and one trailing-newline flag enter the process environment, so a large file
+# never becomes argv or environment data. awk preserves CR bytes inside CRLF
+# records; explicitly restoring the final LF distinguishes a terminated last
+# record from an unterminated one without capturing file content in Bash.
+substitute_tokens() {
+  substitute_source="$1"
+  substitute_last_byte="$(LC_ALL=C tail -c 1 "$substitute_source" | od -An -tu1 | tr -d '[:space:]')"
+  substitute_trailing_lf=0
+  [ "$substitute_last_byte" != 10 ] || substitute_trailing_lf=1
+  TPL_TRAILING_LF="$substitute_trailing_lf" awk '
+    function repl(s, tok, val,   out, pos) {
+      out = ""
+      while ((pos = index(s, tok)) > 0) {
+        out = out substr(s, 1, pos - 1) val
+        s = substr(s, pos + length(tok))
+      }
+      return out s
+    }
+    {
+      s = $0
+      s = repl(s, "__ProjectName__", ENVIRON["TPL_PROJECT"])
+      s = repl(s, "__Author__",      ENVIRON["TPL_AUTHOR"])
+      s = repl(s, "__AuthorEmail__", ENVIRON["TPL_AUTHOR_EMAIL"])
+      s = repl(s, "__GitHubOwner__", ENVIRON["TPL_OWNER"])
+      s = repl(s, "__Description__", ENVIRON["TPL_DESC"])
+      s = repl(s, "__Year__",        ENVIRON["TPL_YEAR"])
+      if (NR > 1) printf "\n"
+      printf "%s", s
+    }
+    END { if (ENVIRON["TPL_TRAILING_LF"] == "1") printf "\n" }
+  ' "$substitute_source"
+}
+
+# Materialize every supported transform in the external transaction directory
+# before reserving or changing a path in the repository. Snapshots also make a
+# later rollback byte-for-byte.
+mkdir -p "$transaction_dir/originals" "$transaction_dir/updates"
+for ((i = 0; i < content_count; i++)); do
+  file="${content_files[i]}"
+  original="$transaction_dir/originals/$i"
+  update="$transaction_dir/updates/$i"
+  candidate="$transaction_dir/candidate-$i"
+  classification_file="$transaction_dir/classification-$i"
+
+  if ! ordinary_file "$file"; then
+    die "content source '${file#"$repo_root"/}' changed during input preflight; refusing to read through it."
+  fi
+  if ! LC_ALL=C od -An -v -tu1 "$file" | awk '
+      { for (field = 1; field <= NF; field++) if ($field == 0) binary = 1 }
+      END { print binary ? "binary" : "text" }
+    ' > "$classification_file"; then
+    die "could not classify '${file#"$repo_root"/}' during input preflight; no files were changed."
+  fi
+  IFS= read -r classification < "$classification_file" ||
+    die "could not read the classification for '${file#"$repo_root"/}'; no files were changed."
+
+  required_text=0
+  case "$file" in
+    "$release_workflow"|"$ci_workflow"|"$repo_root/Cargo.toml") required_text=1 ;;
+  esac
+  if [ "$classification" = binary ]; then
+    ((required_text == 0)) ||
+      die "required template file '${file#"$repo_root"/}' is binary (contains NUL); no files were changed."
+    continue
+  fi
+  if ! iconv -f UTF-8 -t UTF-8 "$file" > /dev/null; then
+    ((required_text == 0)) ||
+      die "required template file '${file#"$repo_root"/}' is unsupported (not valid UTF-8); no files were changed."
+    continue
+  fi
+  if ! cp "$file" "$original"; then
+    die "could not snapshot '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
+
+  case "$file" in
+    *.toml) c=$crate_t; a=$author_t; ae=$author_email_t; o=$owner_t; d=$desc_t; y=$year_t ;;
+    *)      c=$crate_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
+  esac
+  if [ "$file" = "$release_workflow" ]; then
+    a="$author_release"
+    ae="$author_email_release"
+  fi
+  if ! TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
+       TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" \
+       substitute_tokens "$original" > "$candidate"; then
+    die "could not transform '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
+
+  if [ "$file" = "$ci_workflow" ]; then
+    if ! awk '
+      /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
+        if (inside || seen) exit 42
+        inside = 1
+        seen = 1
+        next
+      }
+      /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
+        if (!inside) exit 42
+        inside = 0
+        next
+      }
+      !inside { print }
+      END { if (inside || seen != 1) exit 42 }
+    ' "$candidate" > "$update"; then
+      die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
+    fi
+  elif ! mv "$candidate" "$update"; then
+    die "could not stage '${file#"$repo_root"/}' during preflight; no files were changed."
+  fi
+
+  if cmp -s "$original" "$update"; then
+    rm -f "$original" "$update" "$candidate"
+  else
+    compare_status=$?
+    if ((compare_status > 1)); then
+      die "could not compare staged content for '${file#"$repo_root"/}'; no files were changed."
+    fi
+    content_plan_files[content_plan_count]="$file"
+    content_plan_originals[content_plan_count]="$original"
+    content_plan_updates[content_plan_count]="$update"
+    content_plan_count=$((content_plan_count + 1))
+  fi
+done
 
 collision_messages=()
 collision_count=0
@@ -485,125 +658,6 @@ if ((collision_count > 0)); then
   exit 1
 fi
 
-# Validate the template-only content edit during preflight, not after earlier
-# token replacements. The same checked transform is executed below.
-if ! awk '
-  /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
-    if (inside || seen) exit 42
-    inside = 1
-    seen = 1
-    next
-  }
-  /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
-    if (!inside) exit 42
-    inside = 0
-    next
-  }
-  END { if (inside || seen != 1) exit 42 }
-' "$ci_workflow" > /dev/null; then
-  die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
-fi
-
-# Literal, backslash-safe token replacement. The source text and the six values
-# are passed through the environment because awk's ENVIRON does NO escape
-# processing — unlike bash's `${var//pat/repl}`, which collapses the doubled
-# backslashes toml_escape adds (`\\`->`\` on bash >= 4.3; bash 3.2 leaves them,
-# so it is also version-dependent) and would emit a Cargo.toml that fails to
-# parse on any backslash. The whole file is handled in BEGIN via ENVIRON so no
-# record splitting can add or drop a trailing newline.
-substitute_tokens() {
-  awk '
-    function repl(s, tok, val,   out, i) {
-      out = ""
-      while ((i = index(s, tok)) > 0) {
-        out = out substr(s, 1, i - 1) val
-        s = substr(s, i + length(tok))
-      }
-      return out s
-    }
-    BEGIN {
-      s = ENVIRON["TPL_SRC"]
-      s = repl(s, "__ProjectName__", ENVIRON["TPL_PROJECT"])
-      s = repl(s, "__Author__",      ENVIRON["TPL_AUTHOR"])
-      s = repl(s, "__AuthorEmail__", ENVIRON["TPL_AUTHOR_EMAIL"])
-      s = repl(s, "__GitHubOwner__", ENVIRON["TPL_OWNER"])
-      s = repl(s, "__Description__", ENVIRON["TPL_DESC"])
-      s = repl(s, "__Year__",        ENVIRON["TPL_YEAR"])
-      printf "%s", s
-    }'
-}
-
-# Materialize exact originals and final replacement bytes before the first
-# template write. This makes content rollback byte-for-byte and ensures every
-# transform error is still a preflight error.
-mkdir -p "$transaction_dir/originals" "$transaction_dir/updates"
-for ((i = 0; i < content_count; i++)); do
-  file="${content_files[i]}"
-  original="$transaction_dir/originals/$i"
-  update="$transaction_dir/updates/$i"
-  candidate="$transaction_dir/candidate-$i"
-  if ! cp "$file" "$original"; then
-    die "could not snapshot '${file#"$repo_root"/}' during preflight; no files were changed."
-  fi
-  case "$file" in
-    *.toml) c=$crate_t; a=$author_t; ae=$author_email_t; o=$owner_t; d=$desc_t; y=$year_t ;;
-    *)      c=$crate_name; a=$author; ae=$author_email; o=$github_owner; d=$description; y=$year ;;
-  esac
-  # Preserve trailing newlines: append a sentinel before capture, strip it after.
-  if ! content="$(cat "$original"; read_status=$?; ((read_status == 0)) || exit "$read_status"; printf x)"; then
-    die "could not read '${file#"$repo_root"/}' during preflight; no files were changed."
-  fi
-  content="${content%x}"
-  if [ "$file" = "$release_workflow" ]; then
-    a="$author_release"
-    ae="$author_email_release"
-  fi
-  if ! new="$(TPL_SRC="$content" TPL_PROJECT="$c" TPL_AUTHOR="$a" TPL_AUTHOR_EMAIL="$ae" \
-         TPL_OWNER="$o" TPL_DESC="$d" TPL_YEAR="$y" substitute_tokens; transform_status=$?; \
-         ((transform_status == 0)) || exit "$transform_status"; printf x)"; then
-    die "could not transform '${file#"$repo_root"/}' during preflight; no files were changed."
-  fi
-  new="${new%x}"
-
-  if [ "$file" = "$ci_workflow" ]; then
-    if ! printf '%s' "$new" > "$candidate"; then
-      die "could not stage .github/workflows/ci.yml during preflight; no files were changed."
-    fi
-    if ! awk '
-      /^[[:space:]]*# template-only-init-security: begin[[:space:]]*$/ {
-        if (inside || seen) exit 42
-        inside = 1
-        seen = 1
-        next
-      }
-      /^[[:space:]]*# template-only-init-security: end[[:space:]]*$/ {
-        if (!inside) exit 42
-        inside = 0
-        next
-      }
-      !inside { print }
-      END { if (inside || seen != 1) exit 42 }
-    ' "$candidate" > "$update"; then
-      die "expected exactly one template-only init-security block in .github/workflows/ci.yml"
-    fi
-  elif ! printf '%s' "$new" > "$update"; then
-    die "could not stage '${file#"$repo_root"/}' during preflight; no files were changed."
-  fi
-
-  if cmp -s "$original" "$update"; then
-    rm -f "$original" "$update" "$candidate"
-  else
-    compare_status=$?
-    if ((compare_status > 1)); then
-      die "could not compare staged content for '${file#"$repo_root"/}'; no files were changed."
-    fi
-    content_plan_files[content_plan_count]="$file"
-    content_plan_originals[content_plan_count]="$original"
-    content_plan_updates[content_plan_count]="$update"
-    content_plan_count=$((content_plan_count + 1))
-  fi
-done
-
 if [ "${INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT:-}" = "1" ]; then
   printf '%s\n' 'INITIALIZER_TEST_PREFLIGHT_READY'
   if [ -n "${INIT_SECURITY_TEST_READY_FILE:-}" ] &&
@@ -626,6 +680,12 @@ transaction_active=1
 # 1) Apply the staged content plan. Both initializers are skipped because they
 #    carry the literal token strings as search keys.
 for ((i = 0; i < content_plan_count; i++)); do
+  if ! ordinary_file "${content_plan_files[i]}"; then
+    die "content source '${content_plan_files[i]#"$repo_root"/}' changed after preflight; refusing to write through it."
+  fi
+  # cp can fail after truncating the target. Include this verified path in the
+  # rollback journal immediately before attempting the mutation.
+  completed_content_count=$((i + 1))
   if ! cp "${content_plan_updates[i]}" "${content_plan_files[i]}"; then
     die "could not update '${content_plan_files[i]#"$repo_root"/}'."
   fi
