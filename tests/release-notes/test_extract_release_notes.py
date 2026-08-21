@@ -86,6 +86,45 @@ class ExtractReleaseNotesTests(unittest.TestCase):
                 ),
             ),
             (
+                "bare marker owns properly indented multiline content",
+                changelog(
+                    """
+### Added
+-
+  Preserved continuation.
+
+  - Preserve a nested item.
+
+  ```text
+  preserved fence
+  ```
+"""
+                ),
+                textwrap.dedent(
+                    """\
+                    ### Added
+                    -
+                      Preserved continuation.
+
+                      - Preserve a nested item.
+
+                      ```text
+                      preserved fence
+                      ```"""
+                ),
+            ),
+            (
+                "reviewer bare-marker boundary probe",
+                changelog(
+                    """
+### Added
+-
+  Preserved continuation.
+"""
+                ),
+                "### Added\n-\n  Preserved continuation.",
+            ),
+            (
                 "multiple populated sections preserve order",
                 changelog(
                     """
@@ -114,6 +153,30 @@ This paragraph is outside the list item.
 """
                 ),
                 "### Fixed\n- Included before the boundary.\n- Included after the boundary.",
+            ),
+            (
+                "one-space prose is outside a top-level list item",
+                changelog(
+                    """
+### Added
+- Kept.
+
+ Outside paragraph.
+"""
+                ),
+                "### Added\n- Kept.",
+            ),
+            (
+                "continuation indentation follows marker padding",
+                changelog(
+                    """
+### Added
+-   Kept with wider padding.
+    Four-column continuation.
+   Three-column paragraph is outside.
+"""
+                ),
+                "### Added\n-   Kept with wider padding.\n    Four-column continuation.",
             ),
             (
                 "next version bounds Unreleased",

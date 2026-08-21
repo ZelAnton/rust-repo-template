@@ -13,7 +13,44 @@ UNRELEASED_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 SECTION_HEADER_RE = re.compile(r"^###[ \t]+\S")
-REAL_BULLET_RE = re.compile(r"^-[ \t]+\S")
+BULLET_MARKER_RE = re.compile(r"^-(?:$|(?P<padding>[ \t]+)(?P<content>\S.*)?)$")
+
+
+def _advance_column(column: int, whitespace: str) -> int:
+    """Return the visual column after CommonMark-style spaces and tabs."""
+    for character in whitespace:
+        if character == "\t":
+            column += 4 - (column % 4)
+        else:
+            column += 1
+    return column
+
+
+def _leading_columns(line: str) -> int:
+    whitespace = line[: len(line) - len(line.lstrip(" \t"))]
+    return _advance_column(0, whitespace)
+
+
+def _bullet_marker(line: str) -> tuple[int, bool] | None:
+    """Return this top-level item's content indent and inline-content state."""
+    match = BULLET_MARKER_RE.match(line)
+    if match is None:
+        return None
+
+    content = match.group("content")
+    if content is None:
+        # An empty marker can still introduce content on a following line. The
+        # default list padding is one column, so continuation starts at column 2.
+        return 2, False
+
+    padding = match.group("padding")
+    if padding is None:
+        raise AssertionError("inline bullet content must follow marker padding")
+    padding_columns = _advance_column(1, padding) - 1
+    # CommonMark treats one to four columns as list padding. With five or more,
+    # one column is padding and the remainder belongs to the item content.
+    content_indent = 1 + padding_columns if padding_columns <= 4 else 2
+    return content_indent, True
 
 
 def _bullet_spans(lines: list[str]) -> list[tuple[int, int]]:
@@ -22,12 +59,15 @@ def _bullet_spans(lines: list[str]) -> list[tuple[int, int]]:
     index = 0
 
     while index < len(lines):
-        if not REAL_BULLET_RE.match(lines[index]):
+        marker = _bullet_marker(lines[index])
+        if marker is None:
             index += 1
             continue
 
+        content_indent, has_content = marker
         start = index
         end = index + 1
+        is_real = has_content
         index += 1
 
         while index < len(lines):
@@ -35,13 +75,15 @@ def _bullet_spans(lines: list[str]) -> list[tuple[int, int]]:
             if not line.strip():
                 index += 1
                 continue
-            if line[:1] in {" ", "\t"}:
+            if _leading_columns(line) >= content_indent:
+                is_real = True
                 end = index + 1
                 index += 1
                 continue
             break
 
-        spans.append((start, end))
+        if is_real:
+            spans.append((start, end))
 
     return spans
 
