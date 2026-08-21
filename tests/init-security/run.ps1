@@ -7,6 +7,7 @@ param(
     [switch]$ContentSafetyOnly,
     [switch]$GitFileOnly,
     [switch]$NoGitOnly,
+    [switch]$DuplicateGitPathOnly,
     [switch]$ReleaseIdentityOnly
 )
 
@@ -361,6 +362,28 @@ function Add-ExcludedTraversalFixtures([string]$copyRoot) {
     }
 }
 
+function Assert-ReleaseIdentityWorkflowUpdated(
+    [string]$copyRoot,
+    [string]$description,
+    [string]$author,
+    [string]$authorEmail
+) {
+    $releaseWorkflow = [IO.File]::ReadAllText(
+        (Join-Path $copyRoot '.github/workflows/release.yml')
+    )
+    foreach ($placeholder in @('__Author__', '__AuthorEmail__')) {
+        if ($releaseWorkflow.Contains($placeholder)) {
+            throw "$description left $placeholder unresolved in the hidden release workflow"
+        }
+    }
+    foreach ($identity in @($author, $authorEmail)) {
+        $encodedIdentity = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($identity))
+        if (-not $releaseWorkflow.Contains($encodedIdentity)) {
+            throw "$description did not update release identity data in the hidden release workflow"
+        }
+    }
+}
+
 function Assert-HiddenInitializerFixtureUpdated(
     [string]$copyRoot,
     [string]$description,
@@ -376,20 +399,7 @@ function Assert-HiddenInitializerFixtureUpdated(
         'Initializer security regression fixture' `
         "$description did not replace content inside a hidden directory"
 
-    $releaseWorkflow = [IO.File]::ReadAllText(
-        (Join-Path $copyRoot '.github/workflows/release.yml')
-    )
-    foreach ($placeholder in @('__Author__', '__AuthorEmail__')) {
-        if ($releaseWorkflow.Contains($placeholder)) {
-            throw "$description left $placeholder unresolved in the hidden release workflow"
-        }
-    }
-    foreach ($identity in @($author, $authorEmail)) {
-        $encodedIdentity = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($identity))
-        if (-not $releaseWorkflow.Contains($encodedIdentity)) {
-            throw "$description did not update release identity data in the hidden release workflow"
-        }
-    }
+    Assert-ReleaseIdentityWorkflowUpdated $copyRoot $description $author $authorEmail
 
     $copyName = [IO.Path]::GetFileName($copyRoot)
     foreach ($fixture in (Get-ExcludedTraversalFixtures)) {
@@ -635,6 +645,62 @@ exit 1
         '--expected-name', $expectedAuthor, '--expected-email', $expectedEmail
     ) $copyRoot
     Assert-ProcessSucceeded $verification "PowerShell no-Git workflow verification ($source)"
+}
+
+function Test-PowerShellDuplicateGitPathDiscovery {
+    if ($IsWindows) {
+        Write-Host 'Skipping duplicate-Git PATH fixture: the regression targets Unix executable aliases.'
+        return
+    }
+
+    $copyRoot = Join-Path $script:TempRoot 'powershell-duplicate-git-path'
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+
+    $gitCommands = @(Get-Command git -CommandType Application -ErrorAction Stop)
+    $realGit = $gitCommands[0].Source
+    $aliasDirectories = foreach ($suffix in @('first', 'second')) {
+        $directory = Join-Path $script:TempRoot "duplicate-git-path-$suffix"
+        [void](New-Item -ItemType Directory -Path $directory)
+        [void][IO.File]::CreateSymbolicLink((Join-Path $directory 'git'), $realGit)
+        $directory
+    }
+    $environment = @{ PATH = $aliasDirectories -join [IO.Path]::PathSeparator }
+
+    $author = '.Duplicate Git Path Author.'
+    $authorEmail = '.duplicate-git-path@example.com.'
+    $init = Invoke-CapturedProcess $realGit @('init', '-q') $copyRoot
+    Assert-ProcessSucceeded $init 'git init for duplicate-Git PATH fixture'
+    foreach ($entry in @(
+        @('user.name', $author),
+        @('user.email', $authorEmail)
+    )) {
+        $configured = Invoke-CapturedProcess `
+            $realGit @('config', '--local', $entry[0], $entry[1]) $copyRoot
+        Assert-ProcessSucceeded $configured "git config for duplicate-Git PATH fixture ($($entry[0]))"
+    }
+
+    $probe = @'
+$commands = @(Get-Command git -CommandType Application -ErrorAction Stop)
+if ($commands.Count -lt 2) { exit 1 }
+'@
+    $discovery = Invoke-CapturedProcess `
+        $script:PwshPath @('-NoProfile', '-Command', $probe) $copyRoot $environment
+    Assert-ProcessSucceeded $discovery 'PowerShell duplicate-Git PATH environment probe'
+
+    $invocation = Get-InitializerInvocation powershell $copyRoot $author $authorEmail `
+        -UseDefaultAuthor -UseDefaultAuthorEmail
+    $invocation.Environment = $environment
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result 'PowerShell initializer with duplicate Git PATH entries'
+    Assert-ReleaseIdentityWorkflowUpdated `
+        $copyRoot 'PowerShell initializer with duplicate Git PATH entries' $author $authorEmail
+
+    $verification = Invoke-CapturedProcess $script:PythonPath @(
+        $script:VerifierPath, '--repo', $copyRoot, '--bash', $script:BashPath,
+        '--expected-name', $author, '--expected-email', $authorEmail
+    ) $copyRoot
+    Assert-ProcessSucceeded $verification 'PowerShell duplicate-Git PATH workflow verification'
 }
 
 function Test-SafeContentSuccess(
@@ -1596,6 +1662,12 @@ try {
         return
     }
 
+    if ($DuplicateGitPathOnly) {
+        Test-PowerShellDuplicateGitPathDiscovery
+        Write-Host 'PowerShell duplicate-Git PATH discovery check passed.' -ForegroundColor Green
+        return
+    }
+
     if ($GitFileOnly) {
         foreach ($kind in @('powershell', 'posix')) {
             Test-GitFileExclusion $kind
@@ -1677,6 +1749,8 @@ try {
     }
 
     Test-DiagnosticNormalization
+
+    Test-PowerShellDuplicateGitPathDiscovery
 
     foreach ($source in @('defaults', 'explicit')) {
         Test-PowerShellInitializationWithoutGit $source

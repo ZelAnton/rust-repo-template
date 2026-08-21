@@ -81,7 +81,8 @@ if ($crateSafe -notmatch '^[a-z]') {
     throw "Invalid -ProjectName '$ProjectName' -> derived crate name '$crateSafe' starts with a non-letter; cargo requires a crate name that starts with a letter. Pick a project name whose first alphanumeric is a letter (e.g. my-tool)."
 }
 
-$gitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue
+$gitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
 $gitPath = if ($gitCommand) { $gitCommand.Source } else { $null }
 
 function Get-GitConfigValue([string]$key, [string]$executablePath) {
