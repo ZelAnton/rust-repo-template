@@ -318,6 +318,34 @@ foreach ($key in $replacements.Keys) {
 }
 $tomlFileExtensions = @('.toml')
 
+$templateTokenPattern = [Text.RegularExpressions.Regex]::new(
+    '__(?:ProjectName|Author|AuthorEmail|GitHubOwner|Description|Year)__',
+    [Text.RegularExpressions.RegexOptions]::CultureInvariant
+)
+
+function Expand-TemplateTokensSinglePass(
+    [AllowEmptyString()][string]$text,
+    [Collections.IDictionary]$replacementMap
+) {
+    # Enumerate matches from the original text before appending any values. A
+    # replacement may itself contain a supported token spelling, but it never
+    # becomes input to this matcher.
+    $matches = $templateTokenPattern.Matches($text)
+    if ($matches.Count -eq 0) {
+        return $text
+    }
+
+    $expanded = [Text.StringBuilder]::new($text.Length)
+    $cursor = 0
+    foreach ($match in $matches) {
+        [void]$expanded.Append($text, $cursor, $match.Index - $cursor)
+        [void]$expanded.Append([string]$replacementMap[$match.Value])
+        $cursor = $match.Index + $match.Length
+    }
+    [void]$expanded.Append($text, $cursor, $text.Length - $cursor)
+    $expanded.ToString()
+}
+
 $excludedDirs = @('.git', '.jj', 'target')
 
 function Test-Excluded([string]$fullPath) {
@@ -591,7 +619,6 @@ foreach ($file in ($repositoryFiles | Sort-Object FullName)) {
         continue
     }
 
-    $new = $text
     $map = if ($canonicalFile.Equals($releaseWorkflowPath, $pathComparison)) {
         $releaseWorkflowReplacements
     } elseif ($tomlFileExtensions -contains $file.Extension) {
@@ -599,9 +626,7 @@ foreach ($file in ($repositoryFiles | Sort-Object FullName)) {
     } else {
         $replacements
     }
-    foreach ($key in $map.Keys) {
-        $new = $new.Replace($key, $map[$key])
-    }
+    $new = Expand-TemplateTokensSinglePass $text $map
     if ($canonicalFile.Equals($ciWorkflowPath, $pathComparison)) {
         $templateOnlyMatches = $templateOnlyCiPattern.Matches($new)
         if ($templateOnlyMatches.Count -ne 1) {

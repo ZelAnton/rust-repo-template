@@ -9,7 +9,8 @@ param(
     [switch]$NoGitOnly,
     [switch]$DuplicateGitPathOnly,
     [switch]$ReleaseIdentityOnly,
-    [switch]$TomlOnly
+    [switch]$TomlOnly,
+    [switch]$SinglePassOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -458,6 +459,133 @@ function Invoke-TomlBasicStringSuite {
         }
     }
     Write-Host 'Initializer TOML basic-string parity checks passed.' -ForegroundColor Green
+}
+
+function Get-SinglePassReplacementValues {
+    $tokenSpellings = @(
+        '__ProjectName__',
+        '__Author__',
+        '__AuthorEmail__',
+        '__GitHubOwner__',
+        '__Description__',
+        '__Year__'
+    )
+    $tokenCorpus = $tokenSpellings -join '|'
+
+    # ProjectName and Year have intentionally constrained output contracts (a
+    # normalized crate slug and an integer). Every free-form replacement input
+    # carries every token spelling so any rescan is observable.
+    [ordered]@{
+        ProjectName = 'single-pass-security'
+        Author = "Author `"$tokenCorpus`" \ exact"
+        AuthorEmail = "cascade+$($tokenSpellings -join '.')@example.com"
+        GitHubOwner = "owner `"$tokenCorpus`" \ path`nowner-second-line"
+        Description = "description `"$tokenCorpus`" \ path`ndescription-second-line"
+        Year = '2026'
+    }
+}
+
+function Add-SinglePassReplacementFixtures([string]$copyRoot) {
+    Add-TextFixture $copyRoot '.initializer-single-pass/ordinary.txt' (@(
+        'project=<__ProjectName__>'
+        'author=<__Author__>'
+        'author_email=<__AuthorEmail__>'
+        'github_owner=<__GitHubOwner__>'
+        'description=<__Description__>'
+        'year=<__Year__>'
+        'mixed=<__Author____Description____AuthorEmail____Year____GitHubOwner____ProjectName____Description__>'
+    ) -join "`n")
+    Add-TomlRoundTripFixture $copyRoot
+}
+
+function Test-SinglePassLiteralSubstitution(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $values = Get-SinglePassReplacementValues
+    $copyRoot = Join-Path $script:TempRoot "$kind-single-pass-literal"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-SinglePassReplacementFixtures $copyRoot
+
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind single-pass literal substitution"
+
+    $ordinaryExpected = @(
+        "project=<$($values.ProjectName)>"
+        "author=<$($values.Author)>"
+        "author_email=<$($values.AuthorEmail)>"
+        "github_owner=<$($values.GitHubOwner)>"
+        "description=<$($values.Description)>"
+        "year=<$($values.Year)>"
+        "mixed=<$($values.Author)$($values.Description)$($values.AuthorEmail)$($values.Year)$($values.GitHubOwner)$($values.ProjectName)$($values.Description)>"
+    ) -join "`n"
+    Assert-Equal `
+        ([IO.File]::ReadAllText((Join-Path $copyRoot '.initializer-single-pass/ordinary.txt'))) `
+        $ordinaryExpected `
+        "$kind initializer rescanned a replacement value in ordinary text"
+
+    $fixture = Read-TomlAsJson `
+        (Join-Path $copyRoot '.initializer-toml-fixture/values.toml') `
+        "$kind single-pass generated TOML fixture parse"
+    foreach ($property in @(
+        @{ Name = 'project'; Expected = $values.ProjectName },
+        @{ Name = 'author'; Expected = $values.Author },
+        @{ Name = 'author_email'; Expected = $values.AuthorEmail },
+        @{ Name = 'github_owner'; Expected = $values.GitHubOwner },
+        @{ Name = 'description'; Expected = $values.Description },
+        @{ Name = 'year'; Expected = $values.Year }
+    )) {
+        Assert-Equal `
+            $fixture.($property.Name) `
+            $property.Expected `
+            "$kind initializer rescanned or double-serialized $($property.Name) in TOML"
+    }
+
+    $cargo = Read-TomlAsJson `
+        (Join-Path $copyRoot 'Cargo.toml') `
+        "$kind single-pass Cargo.toml parse"
+    Assert-Equal $cargo.package.description $values.Description `
+        "$kind initializer changed the single-pass Cargo description"
+    Assert-Equal `
+        $cargo.package.repository `
+        "https://github.com/$($values.GitHubOwner)/$($values.ProjectName)" `
+        "$kind initializer changed the single-pass Cargo repository"
+    Assert-ReleaseIdentityWorkflowUpdated `
+        $copyRoot `
+        "$kind single-pass literal substitution" `
+        $values.Author `
+        $values.AuthorEmail
+}
+
+function Test-ShouldRunSinglePassSuite([bool]$singlePassOnly, [bool]$hasOtherSelector) {
+    $singlePassOnly -or -not $hasOtherSelector
+}
+
+function Test-SinglePassSuiteRoutingContract {
+    Assert-Equal `
+        (Test-ShouldRunSinglePassSuite -singlePassOnly:$false -hasOtherSelector:$false) `
+        $true `
+        'Default init-security routing omitted the single-pass regression suite'
+    Assert-Equal `
+        (Test-ShouldRunSinglePassSuite -singlePassOnly:$true -hasOtherSelector:$false) `
+        $true `
+        'Focused single-pass routing omitted the single-pass regression suite'
+    Assert-Equal `
+        (Test-ShouldRunSinglePassSuite -singlePassOnly:$false -hasOtherSelector:$true) `
+        $false `
+        'A non-single-pass focused selector unexpectedly enabled the single-pass regression suite'
+}
+
+function Invoke-SinglePassLiteralSubstitutionSuite {
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-SinglePassLiteralSubstitution $kind
+    }
+    Write-Host 'Initializer single-pass literal substitution checks passed.' -ForegroundColor Green
 }
 
 function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]$description) {
@@ -1822,14 +1950,24 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
-    $hasOtherSelector = [bool](
+    $hasNonTomlSelector = [bool](
         $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
-        $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly
+        $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
+        $SinglePassOnly
+    )
+    $hasNonSinglePassSelector = [bool](
+        $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
+        $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
+        $TomlOnly
     )
     $runTomlSuite = Test-ShouldRunTomlSuite `
         -tomlOnly:$TomlOnly `
-        -hasOtherSelector:$hasOtherSelector
+        -hasOtherSelector:$hasNonTomlSelector
+    $runSinglePassSuite = Test-ShouldRunSinglePassSuite `
+        -singlePassOnly:$SinglePassOnly `
+        -hasOtherSelector:$hasNonSinglePassSelector
     Test-TomlSuiteRoutingContract
+    Test-SinglePassSuiteRoutingContract
 
     if ($TomlOnly) {
         Test-DiagnosticNormalization
@@ -1837,6 +1975,14 @@ try {
             throw 'Internal routing error: -TomlOnly did not select the TOML regression suite'
         }
         Invoke-TomlBasicStringSuite
+        return
+    }
+
+    if ($SinglePassOnly) {
+        if (-not $runSinglePassSuite) {
+            throw 'Internal routing error: -SinglePassOnly did not select the single-pass regression suite'
+        }
+        Invoke-SinglePassLiteralSubstitutionSuite
         return
     }
 
@@ -1938,6 +2084,10 @@ try {
 
     if ($runTomlSuite) {
         Invoke-TomlBasicStringSuite
+    }
+
+    if ($runSinglePassSuite) {
+        Invoke-SinglePassLiteralSubstitutionSuite
     }
 
     Test-PowerShellDuplicateGitPathDiscovery
