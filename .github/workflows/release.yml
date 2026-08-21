@@ -102,8 +102,18 @@ jobs:
             exit 1
           fi
 
-      - name: Install tooling
-        run: cargo install cargo-edit --locked
+      # Cargo validates the crates.io package checksum; --locked also requires
+      # the exact dependency graph from cargo-edit's published Cargo.lock.
+      - name: Install cargo-edit
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_edit_version="$(cat tests/ci-tooling/cargo-edit-version.txt)"
+          if [[ ! "$cargo_edit_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::cargo-edit-version.txt must contain one exact SemVer version"
+            exit 1
+          fi
+          cargo install cargo-edit --version "$cargo_edit_version" --locked
 
       - name: Install git-cliff
         uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
