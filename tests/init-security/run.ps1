@@ -1,6 +1,10 @@
 #!/usr/bin/env pwsh
 [CmdletBinding()]
-param()
+param(
+    [switch]$CollisionOnly,
+    [switch]$RaceOnly,
+    [switch]$ReopenedOnly
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -106,6 +110,66 @@ function Invoke-CapturedProcess(
     }
 }
 
+function Invoke-CapturedProcessAtCheckpoint(
+    [string]$fileName,
+    [string[]]$arguments,
+    [string]$workingDirectory,
+    [Collections.IDictionary]$environment,
+    [string]$checkpoint,
+    [scriptblock]$onCheckpoint
+) {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $fileName
+    $startInfo.WorkingDirectory = $workingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $checkpointId = [guid]::NewGuid().ToString('N')
+    $readyFile = Join-Path $script:TempRoot "checkpoint-$checkpointId.ready"
+    $releaseFile = Join-Path $script:TempRoot "checkpoint-$checkpointId.release"
+    $environment['INIT_SECURITY_TEST_READY_FILE'] = $readyFile
+    $environment['INIT_SECURITY_TEST_RELEASE_FILE'] = $releaseFile
+    foreach ($entry in $environment.GetEnumerator()) {
+        $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
+    }
+    foreach ($argument in $arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Failed to start $fileName"
+    }
+
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while (-not (Test-Path -LiteralPath $readyFile) -and -not $process.HasExited) {
+        if ([DateTime]::UtcNow -ge $checkpointDeadline) {
+            $process.Kill($true)
+            throw "Timed out waiting for initializer checkpoint $checkpoint"
+        }
+        Start-Sleep -Milliseconds 20
+    }
+    $observed = Test-Path -LiteralPath $readyFile
+    if ($observed) {
+        & $onCheckpoint
+        [IO.File]::WriteAllText($releaseFile, 'continue')
+    }
+    $process.WaitForExit()
+    $capturedStdout = $stdout.GetAwaiter().GetResult()
+    $capturedStderr = $stderr.GetAwaiter().GetResult()
+    Remove-Item -LiteralPath $readyFile, $releaseFile -Force -ErrorAction SilentlyContinue
+
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout = $capturedStdout
+        Stderr = $capturedStderr
+        CheckpointObserved = $observed -and $capturedStdout.Contains($checkpoint)
+    }
+}
+
 function Assert-ProcessSucceeded($result, [string]$description) {
     if ($result.ExitCode -ne 0) {
         throw "$description failed with exit code $($result.ExitCode).`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
@@ -123,7 +187,7 @@ function Copy-Template([string]$source, [string]$destination) {
 }
 
 function Get-TreeFingerprint([string]$root) {
-    $entries = Get-ChildItem -LiteralPath $root -File -Recurse -Force |
+    $entries = Get-ChildItem -LiteralPath $root -Recurse -Force |
         Where-Object {
             $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
             $relative -notmatch '(^|[\\/])\.(git|jj)([\\/]|$)'
@@ -131,9 +195,34 @@ function Get-TreeFingerprint([string]$root) {
         Sort-Object FullName |
         ForEach-Object {
             $relative = [IO.Path]::GetRelativePath($root, $_.FullName)
-            "$relative=$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+            if ($_.LinkType) {
+                "link:$relative=$($_.Target -join ',')"
+            } elseif ($_.PSIsContainer) {
+                "directory:$relative"
+            } else {
+                "file:$relative=$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)"
+            }
         }
     $entries -join "`n"
+}
+
+function Add-TextFixture([string]$root, [string]$relativePath, [string]$content) {
+    $path = Join-Path $root $relativePath
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) {
+        [void](New-Item -ItemType Directory -Path $parent -Force)
+    }
+    [IO.File]::WriteAllText($path, $content, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Add-DirectoryFixture([string]$root, [string]$relativePath, [string]$marker) {
+    $path = Join-Path $root $relativePath
+    $parent = Split-Path -Parent $path
+    if (-not (Test-Path -LiteralPath $parent)) {
+        [void](New-Item -ItemType Directory -Path $parent -Force)
+    }
+    [void](New-Item -ItemType Directory -Path $path)
+    Add-TextFixture $path 'marker.txt' $marker
 }
 
 function Get-InitializerInvocation(
@@ -143,12 +232,13 @@ function Get-InitializerInvocation(
     [string]$authorEmail,
     [switch]$UseDefaultAuthor,
     [switch]$UseDefaultAuthorEmail,
-    [bool]$KeepScript = $true
+    [bool]$KeepScript = $true,
+    [string]$ProjectName = 'init-security'
 ) {
     if ($kind -eq 'powershell') {
         $arguments = @(
             '-NoProfile', '-File', (Join-Path $copyRoot 'scripts/init.ps1'),
-            '-ProjectName', 'init-security', '-GitHubOwner', 'example',
+            '-ProjectName', $ProjectName, '-GitHubOwner', 'example',
             '-Description', 'Initializer security regression fixture',
             '-Year', '2026'
         )
@@ -167,7 +257,7 @@ function Get-InitializerInvocation(
     # the environment, then construct the real initializer argv inside Bash so
     # this harness measures init.sh and Git rather than that Windows shim.
     $command = @'
-arguments=("$1" --project-name init-security --github-owner example \
+arguments=("$1" --project-name "$INIT_PROJECT_NAME" --github-owner example \
   --description "Initializer security regression fixture" --year 2026)
 if [ "$INIT_KEEP_SCRIPT" = "1" ]; then
   arguments+=(--keep-script)
@@ -186,6 +276,7 @@ exec bash "${arguments[@]}"
         Environment = @{
             INIT_AUTHOR = $author
             INIT_AUTHOR_EMAIL = $authorEmail
+            INIT_PROJECT_NAME = $ProjectName
             INIT_USE_DEFAULT_AUTHOR = if ($UseDefaultAuthor) { '1' } else { '0' }
             INIT_USE_DEFAULT_AUTHOR_EMAIL = if ($UseDefaultAuthorEmail) { '1' } else { '0' }
             INIT_KEEP_SCRIPT = if ($KeepScript) { '1' } else { '0' }
@@ -240,17 +331,50 @@ function Assert-HiddenInitializerFixtureUpdated([string]$copyRoot, [string]$desc
         "$description did not replace content inside a hidden directory"
 }
 
+function Add-NestedRenameFixture([string]$copyRoot) {
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-rename-fixture/__ProjectName__-parent/__ProjectName__-child.txt' `
+        '__Description__'
+}
+
+function Assert-NestedRenameFixtureUpdated([string]$copyRoot, [string]$description) {
+    $renamedPath = Join-Path $copyRoot `
+        '.initializer-rename-fixture/init-security-parent/init-security-child.txt'
+    if (-not (Test-Path -LiteralPath $renamedPath -PathType Leaf)) {
+        throw "$description did not execute nested token-path renames one-to-one"
+    }
+    Assert-Equal `
+        ([IO.File]::ReadAllText($renamedPath)) `
+        'Initializer security regression fixture' `
+        "$description did not update content before nested token-path renames"
+    foreach ($stalePath in @(
+        '.initializer-rename-fixture/__ProjectName__-parent',
+        '.initializer-rename-fixture/init-security-parent/__ProjectName__-child.txt'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $copyRoot $stalePath)) {
+            throw "$description retained stale nested token path $stalePath"
+        }
+    }
+}
+
 function Test-SuccessfulInitialization(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('explicit', 'git-config')][string]$source,
     [string]$caseName,
     [string]$author,
     [string]$authorEmail,
-    [bool]$KeepScript = $true
+    [bool]$KeepScript = $true,
+    [bool]$AddRenameFixtures = $true
 ) {
     $copyRoot = Join-Path $script:TempRoot "$kind-$source-$caseName"
     Copy-Template -source $script:RepoRoot -destination $copyRoot
-    Add-HiddenInitializerFixture $copyRoot
+    if ($AddRenameFixtures) {
+        Add-HiddenInitializerFixture $copyRoot
+        Add-NestedRenameFixture $copyRoot
+    }
+    $settingsTemplate = Join-Path $copyRoot '.claude/settings.json.template'
+    $expectedSettingsHash = (Get-FileHash -LiteralPath $settingsTemplate -Algorithm SHA256).Hash
     $useDefaults = $source -eq 'git-config'
     if ($useDefaults) {
         $init = Invoke-CapturedProcess 'git' @('init', '-q') $copyRoot
@@ -271,7 +395,21 @@ function Test-SuccessfulInitialization(
     $result = Invoke-CapturedProcess $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
     Assert-ProcessSucceeded $result "$kind initializer ($source $caseName)"
     Assert-TemplateOnlySecurityArtifactsRemoved $copyRoot "$kind initializer ($source $caseName)"
-    Assert-HiddenInitializerFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+    if ($AddRenameFixtures) {
+        Assert-HiddenInitializerFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+        Assert-NestedRenameFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+    }
+    $settingsPath = Join-Path $copyRoot '.claude/settings.json'
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+        throw "$kind initializer ($source $caseName) did not activate .claude/settings.json"
+    }
+    if (Test-Path -LiteralPath $settingsTemplate) {
+        throw "$kind initializer ($source $caseName) retained .claude/settings.json.template"
+    }
+    Assert-Equal `
+        ((Get-FileHash -LiteralPath $settingsPath -Algorithm SHA256).Hash) `
+        $expectedSettingsHash `
+        "$kind initializer ($source $caseName) changed shared settings during activation"
 
     foreach ($initializer in @('scripts/init.ps1', 'scripts/init.sh')) {
         $exists = Test-Path -LiteralPath (Join-Path $copyRoot $initializer)
@@ -299,6 +437,655 @@ function Test-SuccessfulInitialization(
     Assert-ProcessSucceeded $verification "$kind generated workflow verification ($source $caseName)"
 
     [IO.File]::ReadAllText((Join-Path $copyRoot '.github/workflows/release.yml'))
+}
+
+function Test-CollisionFailure(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [string]$caseName,
+    [scriptblock]$arrange,
+    [string[]]$expectedDiagnostics
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-collision-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    & $arrange $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Collision Tester' 'collision@example.com'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted the $caseName collision fixture"
+    }
+    Assert-DiagnosticContains $result `
+        'initialization collision preflight failed; no files were changed' `
+        "$kind initializer returned an unclear preflight diagnostic for $caseName."
+    foreach ($expected in $expectedDiagnostics) {
+        Assert-DiagnosticContains $result $expected `
+            "$kind initializer omitted a source-to-destination collision for $caseName."
+    }
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer changed file bytes or tree structure after rejecting $caseName"
+}
+
+function Test-CollisionMatrix([ValidateSet('powershell', 'posix')][string]$kind) {
+    Test-CollisionFailure $kind 'file-to-file' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/file-__ProjectName__.txt' 'source __Description__'
+        Add-TextFixture $root '.initializer-collisions/file-init-security.txt' 'destination must survive'
+    } @(
+        "destination '.initializer-collisions/file-init-security.txt' already exists (source '.initializer-collisions/file-__ProjectName__.txt')"
+    )
+
+    Test-CollisionFailure $kind 'directory-to-directory' {
+        param($root)
+        Add-DirectoryFixture $root '.initializer-collisions/directory-__ProjectName__' 'source directory'
+        Add-DirectoryFixture $root '.initializer-collisions/directory-init-security' 'destination directory'
+    } @(
+        "destination '.initializer-collisions/directory-init-security' already exists (source '.initializer-collisions/directory-__ProjectName__')"
+    )
+
+    Test-CollisionFailure $kind 'file-to-directory' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/mixed-__ProjectName__' 'source file'
+        Add-DirectoryFixture $root '.initializer-collisions/mixed-init-security' 'destination directory'
+    } @(
+        "destination '.initializer-collisions/mixed-init-security' already exists (source '.initializer-collisions/mixed-__ProjectName__')"
+    )
+
+    Test-CollisionFailure $kind 'directory-to-file' {
+        param($root)
+        Add-DirectoryFixture $root '.initializer-collisions/mixed-__ProjectName__' 'source directory'
+        Add-TextFixture $root '.initializer-collisions/mixed-init-security' 'destination file'
+    } @(
+        "destination '.initializer-collisions/mixed-init-security' already exists (source '.initializer-collisions/mixed-__ProjectName__')"
+    )
+
+    Test-CollisionFailure $kind 'settings' {
+        param($root)
+        Add-TextFixture $root '.claude/settings.json' 'existing settings must survive'
+    } @(
+        "destination '.claude/settings.json' already exists (source '.claude/settings.json.template')"
+    )
+
+    Test-CollisionFailure $kind 'multiple' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/first-__ProjectName__.txt' 'first source __Description__'
+        Add-TextFixture $root '.initializer-collisions/first-init-security.txt' 'first destination'
+        Add-DirectoryFixture $root '.initializer-collisions/second-__ProjectName__' 'second source'
+        Add-DirectoryFixture $root '.initializer-collisions/second-init-security' 'second destination'
+        Add-TextFixture $root '.claude/settings.json' 'existing settings'
+    } @(
+        "destination '.initializer-collisions/first-init-security.txt' already exists (source '.initializer-collisions/first-__ProjectName__.txt')",
+        "destination '.initializer-collisions/second-init-security' already exists (source '.initializer-collisions/second-__ProjectName__')",
+        "destination '.claude/settings.json' already exists (source '.claude/settings.json.template')"
+    )
+
+    Test-CollisionFailure $kind 'duplicate-planned-destination' {
+        param($root)
+        Add-TextFixture $root '.initializer-collisions/__ProjectName__init-security.txt' 'first planned source'
+        Add-TextFixture $root '.initializer-collisions/init-security__ProjectName__.txt' 'second planned source'
+    } @(
+        "destination '.initializer-collisions/init-securityinit-security.txt' is planned by multiple sources: '.initializer-collisions/__ProjectName__init-security.txt', '.initializer-collisions/init-security__ProjectName__.txt'"
+    )
+}
+
+function Test-CheckedPosixTraversal([ValidateSet('content', 'rename')][string]$phase) {
+    $copyRoot = Join-Path $script:TempRoot "posix-traversal-$phase"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        posix $copyRoot 'Traversal Tester' 'traversal@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_FAIL_TRAVERSAL'] = $phase
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($result.ExitCode -eq 0) {
+        throw "POSIX initializer accepted a partial $phase traversal"
+    }
+    Assert-DiagnosticContains $result `
+        "could not traverse the complete repository $phase tree; no files were changed" `
+        "POSIX initializer returned an unclear diagnostic for a failed $phase traversal."
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "POSIX initializer mutated the tree after a failed $phase traversal"
+}
+
+function Test-CaseInsensitiveFileSystem([string]$root) {
+    $leaf = ".harness-case-probe-$([guid]::NewGuid().ToString('N')).tmp"
+    $probe = Join-Path $root $leaf.ToLowerInvariant()
+    $alias = Join-Path $root $leaf.ToUpperInvariant()
+    try {
+        [IO.File]::WriteAllText($probe, 'probe', (New-Object Text.UTF8Encoding($false)))
+        return Test-Path -LiteralPath $alias
+    } finally {
+        if (Test-Path -LiteralPath $probe) {
+            Remove-Item -LiteralPath $probe -Force
+        }
+    }
+}
+
+function Test-FileSystemAliases(
+    [string]$root,
+    [string]$firstLeaf,
+    [string]$secondLeaf
+) {
+    $first = Join-Path $root $firstLeaf
+    $second = Join-Path $root $secondLeaf
+    try {
+        $stream = [IO.File]::Open(
+            $first,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        $stream.Dispose()
+        return Test-Path -LiteralPath $second
+    } finally {
+        if (Test-Path -LiteralPath $first) {
+            Remove-Item -LiteralPath $first -Force
+        }
+    }
+}
+
+function Test-CaseAliasDestinations(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-case-alias"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-case-alias/__ProjectName__A.txt' 'upper target'
+    Add-TextFixture $copyRoot '.initializer-case-alias/a__ProjectName__.txt' 'lower target'
+    $caseInsensitive = Test-CaseInsensitiveFileSystem $copyRoot
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        -kind $kind `
+        -copyRoot $copyRoot `
+        -author 'Case Tester' `
+        -authorEmail 'case@example.com' `
+        -ProjectName 'a'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($caseInsensitive) {
+        if ($result.ExitCode -eq 0) {
+            throw "$kind initializer accepted case-alias destinations on a case-insensitive filesystem"
+        }
+        Assert-DiagnosticContains $result `
+            'is planned by multiple sources' `
+            "$kind initializer did not report the case-alias destination collision."
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer mutated a case-insensitive case-alias fixture"
+        return
+    }
+
+    Assert-ProcessSucceeded $result "$kind case-sensitive case-alias initialization"
+    foreach ($entry in @(
+        @('.initializer-case-alias/aA.txt', 'upper target'),
+        @('.initializer-case-alias/aa.txt', 'lower target')
+    )) {
+        $path = Join-Path $copyRoot $entry[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$kind initializer falsely collapsed case-distinct destination $($entry[0])"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($path)) `
+            $entry[1] `
+            "$kind initializer changed case-distinct destination $($entry[0])"
+    }
+}
+
+function Test-UnicodeCaseAliasDestinations(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-unicode-case-alias"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $fixtureRoot = Join-Path $copyRoot '.initializer-unicode-alias'
+    [void](New-Item -ItemType Directory -Path $fixtureRoot)
+    Add-TextFixture $copyRoot '.initializer-unicode-alias/__ProjectName__Åa.txt' 'upper Unicode target'
+    Add-TextFixture $copyRoot '.initializer-unicode-alias/aå__ProjectName__.txt' 'lower Unicode target'
+    $aliases = Test-FileSystemAliases $fixtureRoot '.unicode-probe-aÅa.tmp' '.unicode-probe-aåa.tmp'
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        -kind $kind `
+        -copyRoot $copyRoot `
+        -author 'Unicode Tester' `
+        -authorEmail 'unicode@example.com' `
+        -ProjectName 'a'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($aliases) {
+        if ($result.ExitCode -eq 0) {
+            throw "$kind initializer accepted Unicode case-alias destinations"
+        }
+        Assert-DiagnosticContains $result `
+            'is planned by multiple sources' `
+            "$kind initializer did not report the Unicode case-alias destination collision."
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer mutated a Unicode case-alias fixture"
+        return
+    }
+
+    Assert-ProcessSucceeded $result "$kind Unicode case-distinct initialization"
+    foreach ($entry in @(
+        @('.initializer-unicode-alias/aÅa.txt', 'upper Unicode target'),
+        @('.initializer-unicode-alias/aåa.txt', 'lower Unicode target')
+    )) {
+        $path = Join-Path $copyRoot $entry[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$kind initializer falsely collapsed Unicode-distinct destination $($entry[0])"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($path)) `
+            $entry[1] `
+            "$kind initializer changed Unicode-distinct destination $($entry[0])"
+    }
+}
+
+function Test-PerDirectoryCaseSemantics(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    if (-not $IsWindows) {
+        return
+    }
+
+    $copyRoot = Join-Path $script:TempRoot "$kind-per-directory-case"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    if (-not (Test-CaseInsensitiveFileSystem $copyRoot)) {
+        Write-Host "Skipping $kind per-directory case fixture: temp root is already case-sensitive."
+        return
+    }
+
+    $fixtureRoot = Join-Path $copyRoot '.initializer-per-directory-case'
+    [void](New-Item -ItemType Directory -Path $fixtureRoot)
+    $enable = Invoke-CapturedProcess `
+        'fsutil.exe' `
+        @('file', 'setCaseSensitiveInfo', $fixtureRoot, 'enable') `
+        $copyRoot
+    if ($enable.ExitCode -ne 0 -or (Test-CaseInsensitiveFileSystem $fixtureRoot)) {
+        Write-Host "Skipping $kind per-directory case fixture: case-sensitive directory support is unavailable."
+        return
+    }
+
+    Add-TextFixture $copyRoot '.initializer-per-directory-case/__ProjectName__A.txt' 'upper target'
+    Add-TextFixture $copyRoot '.initializer-per-directory-case/a__ProjectName__.txt' 'lower target'
+    $invocation = Get-InitializerInvocation `
+        -kind $kind `
+        -copyRoot $copyRoot `
+        -author 'Per Directory Tester' `
+        -authorEmail 'per-directory@example.com' `
+        -ProjectName 'a'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind per-directory case-sensitive initialization"
+
+    foreach ($entry in @(
+        @('.initializer-per-directory-case/aA.txt', 'upper target'),
+        @('.initializer-per-directory-case/aa.txt', 'lower target')
+    )) {
+        $path = Join-Path $copyRoot $entry[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$kind initializer ignored the destination directory's case semantics for $($entry[0])"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($path)) `
+            $entry[1] `
+            "$kind initializer changed per-directory case fixture $($entry[0])"
+    }
+}
+
+function Test-PartialReservationMarkerFailure(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('none', 'file', 'directory', 'link')][string]$replacementKind = 'none'
+) {
+    $copyRoot = Join-Path `
+        $script:TempRoot `
+        "$kind-reservation-marker-failure-$replacementKind"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $relativeSource = '.initializer-reservation-failure/a-__ProjectName__.txt'
+    $relativeDestination = '.initializer-reservation-failure/a-init-security.txt'
+    Add-TextFixture $copyRoot $relativeSource 'source must remain byte-identical'
+    $before = Get-TreeFingerprint $copyRoot
+    $destination = Join-Path $copyRoot $relativeDestination
+    $externalContent = "external $replacementKind object must survive partial-marker cleanup"
+    $linkTarget = Join-Path `
+        $script:TempRoot `
+        "$kind-partial-reservation-link-target"
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Reservation Tester' 'reservation@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_FAIL_RESERVATION_MARKER'] = $relativeDestination
+    if ($replacementKind -eq 'none') {
+        $result = Invoke-CapturedProcess `
+            $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    } else {
+        $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PARTIAL_RESERVATION_MARKER_FAILURE'] = `
+            $relativeDestination
+        $result = Invoke-CapturedProcessAtCheckpoint `
+            $invocation.FileName `
+            $invocation.Arguments `
+            $copyRoot `
+            $invocation.Environment `
+            'INITIALIZER_TEST_PARTIAL_RESERVATION_MARKER_FAILED' `
+            {
+                [IO.Directory]::Delete($destination, $false)
+                switch ($replacementKind) {
+                    'file' {
+                        Add-TextFixture $copyRoot $relativeDestination $externalContent
+                    }
+                    'directory' {
+                        Add-DirectoryFixture $copyRoot $relativeDestination $externalContent
+                    }
+                    'link' {
+                        [void](New-Item -ItemType Directory -Path $linkTarget)
+                        Add-TextFixture $linkTarget 'marker.txt' $externalContent
+                        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+                        [void](New-Item -ItemType $linkType -Path $destination -Target $linkTarget)
+                    }
+                }
+            }
+
+        if (-not $result.CheckpointObserved) {
+            throw "$kind initializer did not expose the partial-reservation checkpoint.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+        }
+    }
+
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted an injected ownership-marker failure ($replacementKind)"
+    }
+    Assert-DiagnosticContains $result `
+        $relativeDestination `
+        "$kind initializer returned an unclear partial-reservation diagnostic."
+
+    if ($replacementKind -eq 'none') {
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer stranded or mutated data after a partial reservation"
+        return
+    }
+
+    switch ($replacementKind) {
+        'file' {
+            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                throw "$kind initializer deleted the partial-reservation replacement file"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText($destination)) `
+                $externalContent `
+                "$kind initializer changed the partial-reservation replacement file"
+        }
+        'directory' {
+            $marker = Join-Path $destination 'marker.txt'
+            if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+                throw "$kind initializer deleted the partial-reservation replacement directory"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText($marker)) `
+                $externalContent `
+                "$kind initializer changed the partial-reservation replacement directory"
+        }
+        'link' {
+            $item = Get-Item -LiteralPath $destination -Force
+            if (-not $item.LinkType) {
+                throw "$kind initializer deleted the partial-reservation replacement link/reparse point"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText((Join-Path $linkTarget 'marker.txt'))) `
+                $externalContent `
+                "$kind initializer changed the partial-reservation replacement link target"
+        }
+    }
+
+    switch ($replacementKind) {
+        'file' { [IO.File]::Delete($destination) }
+        'directory' { [IO.Directory]::Delete($destination, $true) }
+        'link' {
+            if ($IsWindows) {
+                [IO.Directory]::Delete($destination, $false)
+            } else {
+                [IO.File]::Delete($destination)
+            }
+        }
+    }
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer mutated the template around a replaced partial reservation"
+}
+
+function Test-ReservationReplacementAfterOwnershipCheck(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('file', 'directory', 'link')][string]$replacementKind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-reservation-replacement-$replacementKind"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $relativeSource = '.initializer-reservation-replacement/a-__ProjectName__.txt'
+    $relativeDestination = '.initializer-reservation-replacement/a-init-security.txt'
+    Add-TextFixture $copyRoot $relativeSource 'source must remain byte-identical'
+    $before = Get-TreeFingerprint $copyRoot
+    $destination = Join-Path $copyRoot $relativeDestination
+    $externalContent = "external $replacementKind object must survive"
+    $linkTarget = Join-Path $script:TempRoot "$kind-reservation-link-target"
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Reservation Race Tester' 'reservation-race@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK'] = `
+        $relativeDestination
+    $result = Invoke-CapturedProcessAtCheckpoint `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment `
+        'INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED' `
+        {
+            Remove-Item -LiteralPath $destination -Recurse -Force
+            switch ($replacementKind) {
+                'file' {
+                    Add-TextFixture $copyRoot $relativeDestination $externalContent
+                }
+                'directory' {
+                    Add-DirectoryFixture $copyRoot $relativeDestination $externalContent
+                }
+                'link' {
+                    [void](New-Item -ItemType Directory -Path $linkTarget)
+                    Add-TextFixture $linkTarget 'marker.txt' $externalContent
+                    $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+                    [void](New-Item -ItemType $linkType -Path $destination -Target $linkTarget)
+                }
+            }
+        }
+
+    if (-not $result.CheckpointObserved) {
+        throw "$kind initializer did not expose the reservation ownership-check checkpoint.`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+    }
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a replaced reservation ($replacementKind)"
+    }
+    Assert-DiagnosticContains $result `
+        $relativeDestination `
+        "$kind initializer returned an unclear replaced-reservation diagnostic."
+
+    switch ($replacementKind) {
+        'file' {
+            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) {
+                throw "$kind initializer deleted the external replacement file"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText($destination)) `
+                $externalContent `
+                "$kind initializer changed the external replacement file"
+        }
+        'directory' {
+            $marker = Join-Path $destination 'marker.txt'
+            if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) {
+                throw "$kind initializer deleted the external non-empty replacement directory"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText($marker)) `
+                $externalContent `
+                "$kind initializer changed the external replacement directory"
+        }
+        'link' {
+            $item = Get-Item -LiteralPath $destination -Force
+            if (-not $item.LinkType) {
+                throw "$kind initializer deleted or replaced the external link/reparse point"
+            }
+            Assert-Equal `
+                ([IO.File]::ReadAllText((Join-Path $linkTarget 'marker.txt'))) `
+                $externalContent `
+                "$kind initializer changed the external link target"
+        }
+    }
+
+    switch ($replacementKind) {
+        'file' { [IO.File]::Delete($destination) }
+        'directory' { [IO.Directory]::Delete($destination, $true) }
+        'link' {
+            if ($IsWindows) {
+                [IO.Directory]::Delete($destination, $false)
+            } else {
+                [IO.File]::Delete($destination)
+            }
+        }
+    }
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer mutated the template around a replaced reservation"
+}
+
+function Test-LateRaceRollback(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-late-race"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-race/a-__ProjectName__.txt' `
+        'first source __Description__'
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-race/z-__ProjectName__.txt' `
+        'second source __Description__'
+    $before = Get-TreeFingerprint $copyRoot
+    $raceDestination = Join-Path $copyRoot '.initializer-race/z-init-security.txt'
+    $raceContent = 'external destination must survive'
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Race Tester' 'race@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT'] = '1'
+    $result = Invoke-CapturedProcessAtCheckpoint `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment `
+        'INITIALIZER_TEST_PREFLIGHT_READY' `
+        { Add-TextFixture $copyRoot '.initializer-race/z-init-security.txt' $raceContent }
+
+    if (-not $result.CheckpointObserved) {
+        throw "$kind initializer did not expose the deterministic post-preflight checkpoint"
+    }
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a destination created after preflight"
+    }
+    Assert-DiagnosticContains $result `
+        "appeared after preflight; refusing to rename source '.initializer-race/z-__ProjectName__.txt'" `
+        "$kind initializer returned an unclear late-race diagnostic."
+    if (-not (Test-Path -LiteralPath $raceDestination -PathType Leaf)) {
+        throw "$kind initializer rollback removed the external race destination"
+    }
+    Assert-Equal `
+        ([IO.File]::ReadAllText($raceDestination)) `
+        $raceContent `
+        "$kind initializer rollback changed the external race destination"
+
+    Remove-Item -LiteralPath $raceDestination -Force
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer did not restore the original tree after a late race"
+}
+
+function Test-SourceDisappearedRaceRollback(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('rename', 'settings')][string]$operation
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-source-disappeared-$operation"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $quarantine = Join-Path $script:TempRoot "$kind-source-disappeared-$operation-quarantine"
+
+    if ($operation -eq 'rename') {
+        $relativeSource = '.initializer-source-race/__ProjectName__-source'
+        $relativeDestination = '.initializer-source-race/init-security-source'
+        Add-DirectoryFixture $copyRoot $relativeSource 'planned source must stay quarantined'
+        $source = Join-Path $copyRoot $relativeSource
+        $destination = Join-Path $copyRoot $relativeDestination
+        $externalMarker = Join-Path $destination 'marker.txt'
+        $expectedDiagnostic = "appeared after preflight; refusing to rename source '$relativeSource'"
+        $checkpointAction = {
+            Move-Item -LiteralPath $source -Destination $quarantine
+            Add-DirectoryFixture $copyRoot $relativeDestination 'independent destination must survive'
+        }
+    } else {
+        $source = Join-Path $copyRoot '.claude/settings.json.template'
+        $destination = Join-Path $copyRoot '.claude/settings.json'
+        $externalMarker = $destination
+        $expectedDiagnostic = "appeared after preflight; refusing to activate source '.claude/settings.json.template'"
+        $checkpointAction = {
+            Move-Item -LiteralPath $source -Destination $quarantine
+            Add-TextFixture $copyRoot '.claude/settings.json' 'independent settings must survive'
+        }
+    }
+
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Source Race Tester' 'source-race@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT'] = '1'
+    $result = Invoke-CapturedProcessAtCheckpoint `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment `
+        'INITIALIZER_TEST_PREFLIGHT_READY' `
+        $checkpointAction
+
+    if (-not $result.CheckpointObserved) {
+        throw "$kind initializer did not expose the source-disappeared $operation checkpoint"
+    }
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a disappeared $operation source and independent destination"
+    }
+    Assert-DiagnosticContains $result `
+        $expectedDiagnostic `
+        "$kind initializer returned an unclear source-disappeared $operation diagnostic."
+    if (-not (Test-Path -LiteralPath $destination)) {
+        throw "$kind initializer rollback removed or relocated the independent $operation destination"
+    }
+    if (-not (Test-Path -LiteralPath $quarantine)) {
+        throw "$kind initializer rollback consumed the quarantined $operation source"
+    }
+    $externalContent = [IO.File]::ReadAllText($externalMarker)
+    $expectedExternalContent = if ($operation -eq 'rename') {
+        'independent destination must survive'
+    } else {
+        'independent settings must survive'
+    }
+    Assert-Equal `
+        $externalContent `
+        $expectedExternalContent `
+        "$kind initializer rollback changed the independent $operation destination"
+
+    Remove-Item -LiteralPath $destination -Recurse -Force
+    Move-Item -LiteralPath $quarantine -Destination $source
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer did not restore the original tree after the source-disappeared $operation race fixture was reset"
 }
 
 function Test-RejectedLineBreak(
@@ -429,12 +1216,74 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    if ($RaceOnly) {
+        foreach ($kind in @('powershell', 'posix')) {
+            Test-LateRaceRollback $kind
+            foreach ($operation in @('rename', 'settings')) {
+                Test-SourceDisappearedRaceRollback $kind $operation
+            }
+        }
+        Write-Host 'Initializer late-race rollback checks passed.' -ForegroundColor Green
+        return
+    }
+
+    if ($ReopenedOnly) {
+        foreach ($kind in @('powershell', 'posix')) {
+            Test-CaseAliasDestinations $kind
+            Test-UnicodeCaseAliasDestinations $kind
+            Test-PerDirectoryCaseSemantics $kind
+            Test-PartialReservationMarkerFailure $kind
+            foreach ($replacementKind in @('file', 'directory', 'link')) {
+                Test-PartialReservationMarkerFailure $kind $replacementKind
+            }
+            foreach ($replacementKind in @('file', 'directory', 'link')) {
+                Test-ReservationReplacementAfterOwnershipCheck $kind $replacementKind
+            }
+            foreach ($operation in @('rename', 'settings')) {
+                Test-SourceDisappearedRaceRollback $kind $operation
+            }
+        }
+        Write-Host 'Reopened initializer collision and rollback checks passed.' -ForegroundColor Green
+        return
+    }
+
+    foreach ($phase in @('content', 'rename')) {
+        Test-CheckedPosixTraversal $phase
+    }
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-CollisionMatrix $kind
+        Test-CaseAliasDestinations $kind
+        Test-UnicodeCaseAliasDestinations $kind
+        Test-PerDirectoryCaseSemantics $kind
+        Test-PartialReservationMarkerFailure $kind
+        foreach ($replacementKind in @('file', 'directory', 'link')) {
+            Test-PartialReservationMarkerFailure $kind $replacementKind
+        }
+        foreach ($replacementKind in @('file', 'directory', 'link')) {
+            Test-ReservationReplacementAfterOwnershipCheck $kind $replacementKind
+        }
+        Test-LateRaceRollback $kind
+        foreach ($operation in @('rename', 'settings')) {
+            Test-SourceDisappearedRaceRollback $kind $operation
+        }
+    }
+    Write-Host 'Initializer traversal, collision, and rollback checks passed.' -ForegroundColor Green
+    if ($CollisionOnly) {
+        return
+    }
+
     Test-DiagnosticNormalization
 
     $ordinaryAuthor = 'Renée  O''Connor, "R&D" + QA'
     $ordinaryEmail = 'anne.o+release@example.com'
     $hostileAuthor = 'Eve "$(touch$IFS./init-security-name-owned)" #:[]{}&*!| suffix'
     $hostileEmail = 'attacker+$(touch$IFS./init-security-email-owned)@example.com'
+
+    $psPlain = Test-SuccessfulInitialization powershell explicit plain-template `
+        $ordinaryAuthor $ordinaryEmail -AddRenameFixtures:$false
+    $shPlain = Test-SuccessfulInitialization posix explicit plain-template `
+        $ordinaryAuthor $ordinaryEmail -AddRenameFixtures:$false
+    Assert-Equal $shPlain $psPlain 'Initializers generated different plain-template release workflows'
 
     $psOrdinary = Test-SuccessfulInitialization powershell explicit ordinary $ordinaryAuthor $ordinaryEmail
     $shOrdinary = Test-SuccessfulInitialization posix explicit ordinary $ordinaryAuthor $ordinaryEmail

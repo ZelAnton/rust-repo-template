@@ -216,11 +216,7 @@ $ciWorkflowPath = [IO.Path]::GetFullPath(
 $templateSecurityTestsPath = [IO.Path]::GetFullPath(
     (Join-Path $repoRoot 'tests/init-security')
 )
-$pathComparison = if ($IsWindows) {
-    [StringComparison]::OrdinalIgnoreCase
-} else {
-    [StringComparison]::Ordinal
-}
+$pathComparison = [StringComparison]::Ordinal
 $templateOnlyCiPattern = [regex]::new(
     '(?ms)^[ \t]*# template-only-init-security: begin\r?\n.*?^[ \t]*# template-only-init-security: end\r?\n?'
 )
@@ -254,20 +250,299 @@ function Test-Excluded([string]$fullPath) {
     return $false
 }
 
+function Test-PathEntryExists([string]$path) {
+    try {
+        [void](Get-Item -LiteralPath $path -Force -ErrorAction Stop)
+        return $true
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        return $false
+    }
+}
+
+function Get-RelativeDisplayPath([string]$path) {
+    [IO.Path]::GetRelativePath($repoRoot, [IO.Path]::GetFullPath($path)).Replace('\', '/')
+}
+
+# Directory.CreateDirectory treats an existing directory as success. The native
+# primitives preserve mkdir's exclusive-create result, which is what lets the
+# filesystem decide case, Unicode, normalization, and per-directory aliases
+# without first touching a directory that belongs to somebody else.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace RustTemplateInit {
+    public static class NativeDirectory {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "CreateDirectoryW")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CreateDirectoryWindows(string path, IntPtr securityAttributes);
+
+        [DllImport("libc", CharSet = CharSet.Ansi, SetLastError = true, EntryPoint = "mkdir")]
+        private static extern int CreateDirectoryUnix(string path, uint mode);
+
+        public static bool TryCreate(string path, out int error) {
+            bool created;
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) {
+                string nativePath = path.StartsWith(@"\\?\", StringComparison.Ordinal)
+                    ? path
+                    : path.StartsWith(@"\\", StringComparison.Ordinal)
+                        ? @"\\?\UNC\" + path.Substring(2)
+                        : @"\\?\" + path;
+                created = CreateDirectoryWindows(nativePath, IntPtr.Zero);
+            } else {
+                created = CreateDirectoryUnix(path, 511) == 0; // 0777, restricted by the caller's umask.
+            }
+            error = created ? 0 : Marshal.GetLastWin32Error();
+            return created;
+        }
+    }
+}
+'@
+
+function New-ExclusiveDirectory([string]$path, [ref]$nativeError) {
+    [RustTemplateInit.NativeDirectory]::TryCreate($path, $nativeError)
+}
+
+function Wait-ReservationCleanupCheckpoint(
+    [string]$relativeDestination,
+    [bool]$partialMarkerFailure
+) {
+    $heldDestination = if ($partialMarkerFailure) {
+        $env:INIT_SECURITY_TEST_HOLD_AFTER_PARTIAL_RESERVATION_MARKER_FAILURE
+    } else {
+        $env:INIT_SECURITY_TEST_HOLD_AFTER_RESERVATION_OWNERSHIP_CHECK
+    }
+    if ($heldDestination -cne $relativeDestination) {
+        return
+    }
+
+    $checkpoint = if ($partialMarkerFailure) {
+        'INITIALIZER_TEST_PARTIAL_RESERVATION_MARKER_FAILED'
+    } else {
+        'INITIALIZER_TEST_RESERVATION_OWNERSHIP_CHECKED'
+    }
+    [Console]::Out.WriteLine($checkpoint)
+    if ($env:INIT_SECURITY_TEST_READY_FILE -and $env:INIT_SECURITY_TEST_RELEASE_FILE) {
+        [IO.File]::WriteAllText($env:INIT_SECURITY_TEST_READY_FILE, 'ready')
+        $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $env:INIT_SECURITY_TEST_RELEASE_FILE)) {
+            if ([DateTime]::UtcNow -ge $checkpointDeadline) {
+                throw 'Initializer reservation cleanup checkpoint was not released.'
+            }
+            Start-Sleep -Milliseconds 20
+        }
+    } elseif ([Console]::In.ReadLine() -cne 'continue') {
+        throw 'Initializer reservation cleanup checkpoint was not released.'
+    }
+}
+
+function Remove-EmptyOrdinaryDirectory([string]$path, [string]$description) {
+    # Keep the observable type/attribute/emptiness checks adjacent to the
+    # non-recursive delete. They reject replacements present at cleanup time;
+    # this path-based API is not an atomic identity guarantee against an
+    # adversarial replacement in the final check/delete window.
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    if (
+        -not $item.PSIsContainer -or
+        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+    ) {
+        throw "$description is not an ordinary non-reparse directory"
+    }
+
+    $entries = [IO.Directory]::EnumerateFileSystemEntries($path).GetEnumerator()
+    try {
+        if ($entries.MoveNext()) {
+            throw "$description is not empty"
+        }
+    } finally {
+        $entries.Dispose()
+    }
+
+    [IO.Directory]::Delete($path, $false)
+}
+
 Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
 
-# 1) Replace tokens in file contents. Both initializers are skipped: they carry
-#    the literal token strings as search keys, so substituting inside them would
-#    corrupt the sibling script.
+# Build every mutation plan before the first write. In particular, a path
+# collision must not be discovered after content replacement has already
+# changed the user's checkout.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+
+# Deepest paths run first so child renames do not invalidate parent sources.
+# Ordinal relative-path ordering makes equal-depth plans reproducible.
+$renamePlan = [Collections.Generic.List[object]]::new()
+foreach ($item in (Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
+    -not (Test-Excluded $_.FullName) -and $_.Name.Contains('__ProjectName__')
+})) {
+    $relativeSource = Get-RelativeDisplayPath $item.FullName
+    $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
+    $destination = Join-Path (Split-Path -Parent $item.FullName) $newName
+    $renamePlan.Add([pscustomobject]@{
+        Source = $item.FullName
+        Destination = $destination
+        RelativeSource = $relativeSource
+        RelativeDestination = Get-RelativeDisplayPath $destination
+        Depth = ($relativeSource.ToCharArray() | Where-Object { $_ -eq '/' }).Count
+        OriginalName = $item.Name
+        NewName = $newName
+    })
+}
+$renamePlan.Sort([Comparison[object]]{
+    param($left, $right)
+    $depthOrder = $right.Depth.CompareTo($left.Depth)
+    if ($depthOrder -ne 0) { return $depthOrder }
+    return [StringComparer]::Ordinal.Compare($left.RelativeSource, $right.RelativeSource)
+})
+
+$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
+$claudeSettings = Join-Path $repoRoot '.claude/settings.json'
+$activateClaudeSettings = Test-PathEntryExists $claudeTemplate
+if ($activateClaudeSettings -and -not (Test-Path -LiteralPath $claudeTemplate -PathType Leaf)) {
+    throw "Expected .claude/settings.json.template to be a file before initialization."
+}
+
+$collisions = [Collections.Generic.List[string]]::new()
+$reservations = [Collections.Generic.List[object]]::new()
+
+function Add-DestinationReservation(
+    [string]$destination,
+    [string]$relativeDestination,
+    [string]$relativeSource
+) {
+    # Reserve the exact absent target with an exclusive mkdir in its real
+    # parent. Record ownership before creating the nested nonce so a partial
+    # marker failure cannot strand an untracked filesystem entry.
+    $nativeError = 0
+    if (New-ExclusiveDirectory $destination ([ref]$nativeError)) {
+        $markerName = ".rust-template-init-reservation-$([guid]::NewGuid().ToString('N'))"
+        $reservation = [pscustomobject]@{
+            Destination = $destination
+            RelativeDestination = $relativeDestination
+            RelativeSource = $relativeSource
+            MarkerPath = Join-Path $destination $markerName
+            MarkerName = $markerName
+            MarkerCreated = $false
+        }
+        # This append must remain immediately after the successful outer mkdir.
+        $reservations.Add($reservation)
+
+        if ($env:INIT_SECURITY_TEST_FAIL_RESERVATION_MARKER -ceq $relativeDestination) {
+            $collisions.Add(
+                "destination '$relativeDestination' ownership marker could not be created after reservation; no files were changed (source '$relativeSource')"
+            )
+            return
+        }
+
+        $markerError = 0
+        if (-not (New-ExclusiveDirectory $reservation.MarkerPath ([ref]$markerError))) {
+            $collisions.Add(
+                "destination '$relativeDestination' ownership marker could not be created after reservation; filesystem error $markerError (source '$relativeSource')"
+            )
+            return
+        }
+        $reservation.MarkerCreated = $true
+        return
+    }
+
+    $owner = $null
+    foreach ($reservation in $reservations) {
+        if (-not $reservation.MarkerCreated) {
+            continue
+        }
+        $candidateMarker = Join-Path $destination $reservation.MarkerName
+        try {
+            $item = Get-Item -LiteralPath $candidateMarker -Force -ErrorAction Stop
+            if (
+                $item.PSIsContainer -and
+                -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            ) {
+                $owner = $reservation
+                break
+            }
+        } catch { }
+    }
+
+    if ($null -ne $owner) {
+        $collisions.Add(
+            "destination '$relativeDestination' is planned by multiple sources: '$($owner.RelativeSource)', '$relativeSource'"
+        )
+    } elseif (Test-PathEntryExists $destination) {
+        $collisions.Add("destination '$relativeDestination' already exists (source '$relativeSource')")
+    } else {
+        $collisions.Add(
+            "destination '$relativeDestination' could not be reserved; filesystem equivalence could not be established (native error $nativeError; source '$relativeSource')"
+        )
+    }
+}
+
+foreach ($entry in $renamePlan) {
+    Add-DestinationReservation `
+        $entry.Destination `
+        $entry.RelativeDestination `
+        $entry.RelativeSource
+}
+if ($activateClaudeSettings) {
+    Add-DestinationReservation `
+        $claudeSettings `
+        (Get-RelativeDisplayPath $claudeSettings) `
+        (Get-RelativeDisplayPath $claudeTemplate)
+}
+
+# Reservation cleanup is part of preflight, not the mutation transaction. Both
+# removals are non-recursive: a replacement file, reparse point, or non-empty
+# directory survives and makes initialization fail closed before template writes.
+$reservationCleanupErrors = [Collections.Generic.List[string]]::new()
+foreach ($reservation in $reservations) {
+    try {
+        if ($reservation.MarkerCreated) {
+            $markerItem = Get-Item -LiteralPath $reservation.MarkerPath -Force -ErrorAction Stop
+            if (
+                -not $markerItem.PSIsContainer -or
+                ($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            ) {
+                throw 'reservation ownership marker changed before cleanup'
+            }
+            Wait-ReservationCleanupCheckpoint $reservation.RelativeDestination $false
+            Remove-EmptyOrdinaryDirectory `
+                $reservation.MarkerPath `
+                'reservation ownership marker'
+            if (Test-PathEntryExists $reservation.MarkerPath) {
+                throw 'reservation ownership marker still exists after cleanup'
+            }
+        } else {
+            Wait-ReservationCleanupCheckpoint $reservation.RelativeDestination $true
+        }
+
+        Remove-EmptyOrdinaryDirectory `
+            $reservation.Destination `
+            'destination reservation'
+        if (Test-PathEntryExists $reservation.Destination) {
+            throw 'destination still exists after reservation cleanup'
+        }
+    } catch {
+        $reservationCleanupErrors.Add(
+            "destination '$($reservation.RelativeDestination)': $($_.Exception.Message)"
+        )
+    }
+}
+if ($reservationCleanupErrors.Count -gt 0) {
+    throw "initialization destination reservation cleanup failed; no template files were changed:`n  $($reservationCleanupErrors -join "`n  ")"
+}
+if ($collisions.Count -gt 0) {
+    throw "initialization collision preflight failed; no files were changed:`n  $($collisions -join "`n  ")"
+}
+
+# Validate and materialize the content plan only in memory. Any malformed
+# template-only CI markers or unreadable file still fail before the first write.
 $files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
     -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
 }
-$contentChanged = 0
+$contentPlan = [Collections.Generic.List[object]]::new()
 foreach ($file in $files) {
     $text = [System.IO.File]::ReadAllText($file.FullName)
     $new = $text
-    $map = if ([IO.Path]::GetFullPath($file.FullName) -eq $releaseWorkflowPath) {
+    $canonicalFile = [IO.Path]::GetFullPath($file.FullName)
+    $map = if ($canonicalFile.Equals($releaseWorkflowPath, $pathComparison)) {
         $releaseWorkflowReplacements
     } elseif ($tomlFileExtensions -contains $file.Extension) {
         $tomlReplacements
@@ -277,40 +552,122 @@ foreach ($file in $files) {
     foreach ($key in $map.Keys) {
         $new = $new.Replace($key, $map[$key])
     }
-    if ([IO.Path]::GetFullPath($file.FullName) -eq $ciWorkflowPath) {
+    if ($canonicalFile.Equals($ciWorkflowPath, $pathComparison)) {
         $templateOnlyMatches = $templateOnlyCiPattern.Matches($new)
         if ($templateOnlyMatches.Count -ne 1) {
             throw "Expected exactly one template-only init-security block in .github/workflows/ci.yml; found $($templateOnlyMatches.Count)."
         }
         $new = $templateOnlyCiPattern.Replace($new, '', 1)
     }
-    if ($new -ne $text) {
-        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-        [System.IO.File]::WriteAllText($file.FullName, $new, (New-Object System.Text.UTF8Encoding($false)))
-        $contentChanged++
+    if ($new -cne $text) {
+        $contentPlan.Add([pscustomobject]@{
+            Path = $file.FullName
+            Content = $new
+            OriginalBytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        })
     }
 }
-Write-Host "    Updated contents in $contentChanged file(s)." -ForegroundColor DarkGray
 
-# 2) Rename files and folders whose name contains the crate-name token.
-#    Deepest paths first so child renames don't invalidate parent paths.
-#    (The single-crate skeleton has none, but workspace adaptations may add
-#    `crates/__ProjectName__` etc., so support it.)
-$named = Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name -like '*__ProjectName__*'
-} | Sort-Object { $_.FullName.Length } -Descending
-foreach ($item in $named) {
-    $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
-    Rename-Item -LiteralPath $item.FullName -NewName $newName
-    Write-Host "    Renamed $($item.Name) -> $newName" -ForegroundColor DarkGray
+if ($env:INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT -eq '1') {
+    [Console]::Out.WriteLine('INITIALIZER_TEST_PREFLIGHT_READY')
+    if ($env:INIT_SECURITY_TEST_READY_FILE -and $env:INIT_SECURITY_TEST_RELEASE_FILE) {
+        [IO.File]::WriteAllText($env:INIT_SECURITY_TEST_READY_FILE, 'ready')
+        $checkpointDeadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (-not (Test-Path -LiteralPath $env:INIT_SECURITY_TEST_RELEASE_FILE)) {
+            if ([DateTime]::UtcNow -ge $checkpointDeadline) {
+                throw 'Initializer security test checkpoint was not released.'
+            }
+            Start-Sleep -Milliseconds 20
+        }
+    } elseif ([Console]::In.ReadLine() -cne 'continue') {
+        throw 'Initializer security test checkpoint was not released.'
+    }
 }
 
-# 3) Activate Claude Code shared settings from the shipped .template (renames
-#    .claude/settings.json.template -> .claude/settings.json).
-$claudeTemplate = Join-Path $repoRoot '.claude/settings.json.template'
-if (Test-Path $claudeTemplate) {
-    Move-Item -LiteralPath $claudeTemplate -Destination (Join-Path $repoRoot '.claude/settings.json') -Force
-    Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+# Content changes and path/settings moves form one rollback domain. A late
+# no-overwrite failure reverses completed moves first, then restores the exact
+# original bytes at their original paths. Race-created destinations are never
+# added to the journal and are therefore never removed by rollback.
+$completedRenames = [Collections.Generic.List[object]]::new()
+$settingsActivated = $false
+try {
+    # 1) Replace tokens in file contents. Both initializers are skipped: they
+    #    carry the literal token strings as search keys, so substituting inside
+    #    them would corrupt the sibling script.
+    foreach ($entry in $contentPlan) {
+        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
+        [System.IO.File]::WriteAllText(
+            $entry.Path,
+            $entry.Content,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+    }
+    Write-Host "    Updated contents in $($contentPlan.Count) file(s)." -ForegroundColor DarkGray
+
+    # 2) Execute the already validated one-to-one rename plan without overwrite.
+    foreach ($entry in $renamePlan) {
+        if (Test-PathEntryExists $entry.Destination) {
+            throw "Destination '$($entry.RelativeDestination)' appeared after preflight; refusing to rename source '$($entry.RelativeSource)'."
+        }
+        Rename-Item -LiteralPath $entry.Source -NewName $entry.NewName -ErrorAction Stop
+        $completedRenames.Add($entry)
+        Write-Host "    Renamed $($entry.OriginalName) -> $($entry.NewName)" -ForegroundColor DarkGray
+    }
+
+    # 3) Activate Claude Code shared settings without overwrite.
+    if ($activateClaudeSettings) {
+        if (Test-PathEntryExists $claudeSettings) {
+            throw "Destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
+        }
+        Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
+        $settingsActivated = $true
+        Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
+    }
+} catch {
+    $originalFailure = $_
+    $rollbackErrors = [Collections.Generic.List[string]]::new()
+
+    if ($settingsActivated) {
+        try {
+            if (Test-PathEntryExists $claudeTemplate) {
+                # The move did not run. Any destination belongs to the racer.
+            } elseif (Test-PathEntryExists $claudeSettings) {
+                Move-Item -LiteralPath $claudeSettings -Destination $claudeTemplate -ErrorAction Stop
+            } else {
+                throw 'neither settings source nor destination exists during rollback'
+            }
+        } catch {
+            $rollbackErrors.Add("settings: $($_.Exception.Message)")
+        }
+    }
+
+    for ($i = $completedRenames.Count - 1; $i -ge 0; $i--) {
+        $entry = $completedRenames[$i]
+        try {
+            if (Test-PathEntryExists $entry.Source) {
+                # The planned move did not run; leave any destination alone.
+            } elseif (Test-PathEntryExists $entry.Destination) {
+                Move-Item -LiteralPath $entry.Destination -Destination $entry.Source -ErrorAction Stop
+            } else {
+                throw "neither source nor destination exists for '$($entry.RelativeSource)'"
+            }
+        } catch {
+            $rollbackErrors.Add("rename '$($entry.RelativeDestination)': $($_.Exception.Message)")
+        }
+    }
+
+    foreach ($entry in $contentPlan) {
+        try {
+            [System.IO.File]::WriteAllBytes($entry.Path, $entry.OriginalBytes)
+        } catch {
+            $rollbackErrors.Add("content '$((Get-RelativeDisplayPath $entry.Path))': $($_.Exception.Message)")
+        }
+    }
+
+    if ($rollbackErrors.Count -gt 0) {
+        throw "Initialization failed and rollback was incomplete: $($originalFailure.Exception.Message)`n  $($rollbackErrors -join "`n  ")"
+    }
+    throw $originalFailure
 }
 
 # 4) Remove template-only files. The agent guide is template meta — pitfalls are

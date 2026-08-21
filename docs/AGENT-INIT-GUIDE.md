@@ -81,7 +81,8 @@ Confirm these facts by reading, not by assuming:
 
    The crate name is required; the rest fall back to sensible defaults. The
    script substitutes tokens (TOML-escaped for `Cargo.toml`), renames any
-   token-named files/folders, and deletes `TEMPLATE.md`,
+   token-named files/folders, refuses all path/settings collisions before its
+   first write, and deletes `TEMPLATE.md`,
    `docs/AGENT-INIT-GUIDE.md`, the template-only initializer security harness
    and its CI step, and both initializers (unless `-KeepScript` /
    `--keep-script`). Run **one** initializer, not both.
@@ -205,6 +206,37 @@ wrong or obsolete.
 ## Failure log
 
 Newest first. Each entry: **Symptom → Root cause → Rule.**
+
+### 2026-08-21 — initializer collisions could overwrite or partially mutate a checkout
+- **Symptom:** A token-named file could replace an existing file on POSIX, a
+  token-named directory could be moved *inside* an existing directory, and an
+  existing `.claude/settings.json` was overwritten. PowerShell often failed on
+  the same collisions only after content replacement had already started.
+- **Root cause:** Renames and shared-settings activation were executed without a
+  checked, filesystem-aware destination plan; collision discovery was delegated
+  to differing shell move semantics after earlier mutations. The POSIX traversal
+  could also return a partial plan without propagating `find` failure.
+- **Rule:** Both initializers preflight every token-path rename and settings
+  activation before the first template write, reject incomplete traversals,
+  and exclusively reserve each exact absent destination as a directory in its
+  own parent so the filesystem decides Unicode, case, normalization, and
+  per-directory equivalence. Record the successful outer `mkdir` before creating
+  its nested ownership nonce, then clean the nonce and reservation only with
+  non-recursive directory removal before template mutation. If the final
+  object-type, reparse-point, and emptiness checks observe a replaced file,
+  link/reparse point, or non-empty directory, cleanup fails closed and leaves
+  that object untouched; the harness injects replacements before those checks.
+  This is not an atomic concurrent-identity guarantee: PowerShell retains a
+  path-based final check/delete window, so an adversarial replacement introduced
+  after the last check has no promised survival or no-data-loss guarantee.
+  Report all conflicting source→destination mappings together.
+  Execute content, path, and settings mutations as one rollback domain with
+  non-overwriting moves, but journal only operations proven completed by this
+  initializer: a destination that appears after preflight must remain untouched
+  even if its planned source disappeared. The harness verifies Unicode aliases,
+  available per-directory behavior, partial reservation creation and replacement
+  before cleanup, reservation replacement after ownership checking, and
+  source-disappeared races for both path and settings moves.
 
 ### 2026-08-20 — template-only initializer checks leaked downstream
 - **Symptom:** An initialized repo retained the initializer security CI step and
