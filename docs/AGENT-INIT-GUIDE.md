@@ -222,9 +222,14 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
   own parent so the filesystem decides Unicode, case, normalization, and
   per-directory equivalence. Record the successful outer `mkdir` before creating
   its nested ownership nonce, then clean the nonce and reservation only with
-  non-recursive directory removal before template mutation. A replaced file,
-  link/reparse point, or non-empty directory must survive while initialization
-  fails closed. Report all conflicting source→destination mappings together.
+  non-recursive directory removal before template mutation. If the final
+  object-type, reparse-point, and emptiness checks observe a replaced file,
+  link/reparse point, or non-empty directory, cleanup fails closed and leaves
+  that object untouched; the harness injects replacements before those checks.
+  This is not an atomic concurrent-identity guarantee: PowerShell retains a
+  path-based final check/delete window, so an adversarial replacement introduced
+  after the last check has no promised survival or no-data-loss guarantee.
+  Report all conflicting source→destination mappings together.
   Execute content, path, and settings mutations as one rollback domain with
   non-overwriting moves, but journal only operations proven completed by this
   initializer: a destination that appears after preflight must remain untouched
