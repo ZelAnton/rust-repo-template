@@ -1,9 +1,8 @@
 version: 2
 
-# Keep GitHub Actions and Cargo dependencies current. The github-actions
-# ecosystem bumps the action SHAs pinned in .github/workflows/*.yml (updating the
-# trailing version comment); the cargo ecosystem bumps crate versions in
-# Cargo.toml / Cargo.lock.
+# Keep GitHub Actions, Cargo dependencies, and CI-only Python tooling current.
+# The github-actions ecosystem bumps action SHAs pinned in workflow files, while
+# the cargo and pip ecosystems update their checked-in manifests and locks.
 updates:
   - package-ecosystem: github-actions
     directory: /
@@ -31,3 +30,15 @@ updates:
         update-types:
           - minor
           - patch
+
+  - package-ecosystem: pip
+    directory: /tests/ci-tooling
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: CI
+    groups:
+      # Keep the yamllint pin and its hashed transitive lock in one review.
+      ci-python-tools:
+        patterns:
+          - "*"

@@ -102,8 +102,10 @@ jobs:
             exit 1
           fi
 
-      - name: Install tooling
-        run: cargo install cargo-edit --locked
+      # Cargo validates the crates.io package checksum; --locked also requires
+      # the exact dependency graph from cargo-edit's published Cargo.lock.
+      - name: Install cargo-edit
+        run: cargo install cargo-edit --version 0.13.13 --locked
 
       - name: Install git-cliff
         uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2

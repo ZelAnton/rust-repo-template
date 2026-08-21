@@ -1,0 +1,2 @@
+# CI-only YAML tooling. Dependabot owns planned version updates for this input.
+yamllint==1.38.0
