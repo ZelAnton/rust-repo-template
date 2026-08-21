@@ -158,6 +158,20 @@ jobs:
           PREV_TAG: ${{ steps.version.outputs.prev_tag }}
         run: |
           set -euo pipefail
+
+          # Reuse the exact parser that later renders the release notes. Exit 3
+          # means a valid changelog has no real notes; any other failure remains
+          # fatal instead of being mistaken for permission to overwrite it.
+          if python3 tests/release-notes/extract_release_notes.py --check CHANGELOG.md; then
+            echo "[Unreleased] already has manual entries; skipping auto-fill."
+            exit 0
+          else
+            notes_status=$?
+            if [ "$notes_status" -ne 3 ]; then
+              exit "$notes_status"
+            fi
+          fi
+
           python3 <<'PY'
           import os
           import pathlib
@@ -178,12 +192,6 @@ jobs:
           if not m:
               print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
               sys.exit(1)
-
-          body = m.group(1)
-          has_real_bullets = any(re.match(r"^-\s+\S", ln) for ln in body.splitlines())
-          if has_real_bullets:
-              print("[Unreleased] already has manual entries; skipping auto-fill.")
-              sys.exit(0)
 
           tag_exists = bool(prev_tag) and subprocess.run(
               ["git", "rev-parse", "--verify", prev_tag], capture_output=True
@@ -220,8 +228,9 @@ jobs:
           print("--------------------------------------------")
           PY
 
-      # Curate release notes from [Unreleased]: keep only "### Header" sections
-      # that have at least one real bullet, dropping placeholder "-" lines.
+      # Curate release notes from [Unreleased]: keep populated "### Header"
+      # sections and each complete top-level bullet block. The checked-in parser
+      # preserves nested Markdown while dropping placeholder "-" lines.
       # Written OUTSIDE the working tree ($RUNNER_TEMP) so it neither dirties the
       # tree (which would abort `cargo publish`) nor lands in the packaged crate.
       - name: Extract release notes
@@ -229,44 +238,7 @@ jobs:
           NOTES_FILE: ${{ runner.temp }}/release-notes.md
         run: |
           set -euo pipefail
-          python3 <<'PY'
-          import os
-          import pathlib
-          import re
-          import sys
-
-          text = pathlib.Path("CHANGELOG.md").read_text()
-          # Bound the body by the next version section, the reference-link block,
-          # or EOF (see the auto-fill step for why the link-block stop matters).
-          m = re.search(r"^## \[Unreleased\]\s*\n(.*?)(?=^## \[|^\[[^\]]+\]:|\Z)", text, re.M | re.S)
-          body = (m.group(1) if m else "").strip()
-
-          parts = re.split(r"(?m)(^### .+$)", body)
-          out = []
-          for i in range(1, len(parts), 2):
-              header = parts[i]
-              section = parts[i + 1] if i + 1 < len(parts) else ""
-              bullets = [ln for ln in section.splitlines() if re.match(r"^-\s+\S", ln)]
-              if bullets:
-                  if out:
-                      out.append("")
-                  out.append(header)
-                  out.extend(bullets)
-
-          result = "\n".join(out).strip()
-          if not result:
-              print(
-                  "::error::[Unreleased] section in CHANGELOG.md is empty. "
-                  "Add release notes before releasing.",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          pathlib.Path(os.environ["NOTES_FILE"]).write_text(result + "\n")
-          print("----- release notes -----")
-          print(result)
-          print("-------------------------")
-          PY
+          python3 tests/release-notes/extract_release_notes.py CHANGELOG.md "$NOTES_FILE"
 
       # Rename the curated `## [Unreleased]` heading to the new version + date,
       # leave a fresh empty Unreleased above it, and rewrite the reference links.

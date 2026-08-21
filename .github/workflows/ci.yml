@@ -36,6 +36,10 @@ jobs:
       - name: Lint YAML
         run: yamllint .
 
+      # Exercise the same standard-library parser used by the release workflow.
+      - name: Test release-note extraction
+        run: python tests/release-notes/test_extract_release_notes.py
+
       # template-only-init-security: begin
       # yamllint installs PyYAML, which this template-only regression harness
       # uses before initialization removes the harness and this CI step.
