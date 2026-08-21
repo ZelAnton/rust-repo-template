@@ -16,7 +16,7 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 REQUIREMENTS_INPUT = ROOT / "tests" / "ci-tooling" / "requirements.in"
 REQUIREMENTS_LOCK = ROOT / "tests" / "ci-tooling" / "requirements.txt"
-EXPECTED_CARGO_EDIT = "0.13.13"
+CARGO_EDIT_VERSION = ROOT / "tests" / "ci-tooling" / "cargo-edit-version.txt"
 
 
 def load_yaml(path: Path) -> dict[object, object]:
@@ -118,14 +118,30 @@ class CiToolPinTests(unittest.TestCase):
         self.assertEqual(matches[0].get("schedule", {}).get("interval"), "weekly")
 
     def test_cargo_edit_install_is_exact_and_locked(self) -> None:
+        version_file = CARGO_EDIT_VERSION.read_text(encoding="utf-8")
+        self.assertRegex(
+            version_file,
+            r"\A[0-9]+\.[0-9]+\.[0-9]+\n?\Z",
+            "cargo-edit-version.txt must contain exactly one full SemVer version",
+        )
+        version = version_file.strip()
+
         workflow = load_yaml(RELEASE_WORKFLOW)
         install = named_step(workflow, "release", "Install cargo-edit")
+        self.assertEqual(install.get("shell"), "bash")
         self.assertEqual(
             install.get("run"),
-            f"cargo install cargo-edit --version {EXPECTED_CARGO_EDIT} --locked",
+            "set -euo pipefail\n"
+            'cargo_edit_version="$(cat tests/ci-tooling/cargo-edit-version.txt)"\n'
+            'if [[ ! "$cargo_edit_version" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then\n'
+            '  echo "::error::cargo-edit-version.txt must contain one exact SemVer version"\n'
+            "  exit 1\n"
+            "fi\n"
+            'cargo install cargo-edit --version "$cargo_edit_version" --locked\n',
         )
 
         text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn(version, text, "workflow must read the single version source")
         self.assertNotRegex(
             text,
             r"(?m)^\s*run:\s*cargo install cargo-edit --locked\s*$",
