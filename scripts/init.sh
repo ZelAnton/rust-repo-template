@@ -238,8 +238,10 @@ trap 'exit 143' TERM
 
 # Build and validate one complete inventory before any repository mutation. The
 # arrays deliberately use Bash 3-compatible indexed arrays so the initializer
-# retains macOS support. find does not follow links; each link and non-regular
-# entry is rejected before any target path is opened.
+# retains macOS support. find includes dot-prefixed entries by default, does not
+# follow links, and prunes VCS/build directories before their children are
+# visited; each remaining link and non-regular entry is rejected before any
+# target path is opened.
 inventory_manifest="$transaction_dir/repository-entries"
 traversal_failure="${INIT_SECURITY_TEST_FAIL_TRAVERSAL:-}"
 if [ "$traversal_failure" = content ] || [ "$traversal_failure" = rename ]; then

@@ -321,7 +321,46 @@ function Add-HiddenInitializerFixture([string]$copyRoot) {
     )
 }
 
-function Assert-HiddenInitializerFixtureUpdated([string]$copyRoot, [string]$description) {
+function Get-ExcludedTraversalFixtures {
+    @(
+        [pscustomobject]@{ Directory = '.git'; Id = 'git' },
+        [pscustomobject]@{
+            Directory = '.initializer-hidden-fixture/nested/.jj'
+            Id = 'nested-jj'
+        },
+        [pscustomobject]@{
+            Directory = '.initializer-hidden-fixture/nested/target'
+            Id = 'nested-target'
+        }
+    )
+}
+
+function Add-ExcludedTraversalFixtures([string]$copyRoot) {
+    $copyName = [IO.Path]::GetFileName($copyRoot)
+    foreach ($fixture in (Get-ExcludedTraversalFixtures)) {
+        $relativePath = "$($fixture.Directory)/__ProjectName__-excluded.txt"
+        Add-TextFixture $copyRoot $relativePath 'excluded __ProjectName__ __Description__'
+
+        $externalPath = Join-Path $script:TempRoot "$copyName-$($fixture.Id)-external.txt"
+        [IO.File]::WriteAllText(
+            $externalPath,
+            'external __ProjectName__ __Description__',
+            (New-Object Text.UTF8Encoding($false))
+        )
+        [void](New-Item `
+            -ItemType HardLink `
+            -Path (Join-Path $copyRoot "$($fixture.Directory)/unread-hard-link.txt") `
+            -Target $externalPath `
+            -ErrorAction Stop)
+    }
+}
+
+function Assert-HiddenInitializerFixtureUpdated(
+    [string]$copyRoot,
+    [string]$description,
+    [string]$author,
+    [string]$authorEmail
+) {
     $fixturePath = Join-Path $copyRoot '.initializer-hidden-fixture/init-security-fixture.txt'
     if (-not (Test-Path -LiteralPath $fixturePath)) {
         throw "$description did not rename a tokenized file inside a hidden directory"
@@ -330,6 +369,48 @@ function Assert-HiddenInitializerFixtureUpdated([string]$copyRoot, [string]$desc
         ([IO.File]::ReadAllText($fixturePath)) `
         'Initializer security regression fixture' `
         "$description did not replace content inside a hidden directory"
+
+    $releaseWorkflow = [IO.File]::ReadAllText(
+        (Join-Path $copyRoot '.github/workflows/release.yml')
+    )
+    foreach ($placeholder in @('__Author__', '__AuthorEmail__')) {
+        if ($releaseWorkflow.Contains($placeholder)) {
+            throw "$description left $placeholder unresolved in the hidden release workflow"
+        }
+    }
+    foreach ($identity in @($author, $authorEmail)) {
+        $encodedIdentity = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($identity))
+        if (-not $releaseWorkflow.Contains($encodedIdentity)) {
+            throw "$description did not update release identity data in the hidden release workflow"
+        }
+    }
+
+    $copyName = [IO.Path]::GetFileName($copyRoot)
+    foreach ($fixture in (Get-ExcludedTraversalFixtures)) {
+        $relativePath = "$($fixture.Directory)/__ProjectName__-excluded.txt"
+        $source = Join-Path $copyRoot $relativePath
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "$description renamed a tokenized path inside excluded directory $relativePath"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($source)) `
+            'excluded __ProjectName__ __Description__' `
+            "$description changed content inside excluded directory $relativePath"
+        $renamed = Join-Path $copyRoot $relativePath.Replace('__ProjectName__', 'init-security')
+        if (Test-Path -LiteralPath $renamed) {
+            throw "$description created a renamed path inside excluded directory $relativePath"
+        }
+
+        $hardLink = Join-Path $copyRoot "$($fixture.Directory)/unread-hard-link.txt"
+        if (-not (Test-Path -LiteralPath $hardLink -PathType Leaf)) {
+            throw "$description changed an unread hard link inside excluded directory $($fixture.Directory)"
+        }
+        $externalPath = Join-Path $script:TempRoot "$copyName-$($fixture.Id)-external.txt"
+        Assert-Equal `
+            ([IO.File]::ReadAllText($externalPath)) `
+            'external __ProjectName__ __Description__' `
+            "$description read or changed a hard-link target from excluded directory $($fixture.Directory)"
+    }
 }
 
 function Add-NestedRenameFixture([string]$copyRoot) {
@@ -372,6 +453,7 @@ function Test-SuccessfulInitialization(
     Copy-Template -source $script:RepoRoot -destination $copyRoot
     if ($AddRenameFixtures) {
         Add-HiddenInitializerFixture $copyRoot
+        Add-ExcludedTraversalFixtures $copyRoot
         Add-NestedRenameFixture $copyRoot
     }
     $settingsTemplate = Join-Path $copyRoot '.claude/settings.json.template'
@@ -397,7 +479,11 @@ function Test-SuccessfulInitialization(
     Assert-ProcessSucceeded $result "$kind initializer ($source $caseName)"
     Assert-TemplateOnlySecurityArtifactsRemoved $copyRoot "$kind initializer ($source $caseName)"
     if ($AddRenameFixtures) {
-        Assert-HiddenInitializerFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
+        Assert-HiddenInitializerFixtureUpdated `
+            $copyRoot `
+            "$kind initializer ($source $caseName)" `
+            $author `
+            $authorEmail
         Assert-NestedRenameFixtureUpdated $copyRoot "$kind initializer ($source $caseName)"
     }
     $settingsPath = Join-Path $copyRoot '.claude/settings.json'
