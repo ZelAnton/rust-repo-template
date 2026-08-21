@@ -152,6 +152,19 @@ entry_exists() { [ -e "$1" ] || [ -L "$1" ]; }
 
 transaction_dir="$(mktemp -d "${TMPDIR:-/tmp}/rust-template-init.XXXXXX")" ||
   die "could not create initializer transaction directory."
+
+# A content source is safe to open through its repository path only while it is
+# a regular non-symlink with exactly one hard link. Re-run this observable
+# contract immediately before every content write and rollback restore; the
+# initial inventory alone cannot protect against a post-preflight substitution.
+ordinary_file() {
+  ordinary_path="$1"
+  ordinary_probe="$transaction_dir/ordinary-file-probe"
+  [ ! -L "$ordinary_path" ] && [ -f "$ordinary_path" ] || return 1
+  find "$ordinary_path" -prune -links 1 -print > "$ordinary_probe" || return 1
+  [ -s "$ordinary_probe" ]
+}
+
 transaction_active=0
 transaction_committed=0
 completed_rename_indices=()
@@ -194,8 +207,7 @@ rollback_transaction() {
   done
 
   for ((rollback_i = 0; rollback_i < completed_content_count; rollback_i++)); do
-    if [ -L "${content_plan_files[rollback_i]}" ] ||
-       [ ! -f "${content_plan_files[rollback_i]}" ] ||
+    if ! ordinary_file "${content_plan_files[rollback_i]}" ||
        ! cp "${content_plan_originals[rollback_i]}" "${content_plan_files[rollback_i]}"; then
       printf "error: rollback could not restore content '%s'\n" \
         "${content_plan_files[rollback_i]#"$repo_root"/}" >&2
@@ -267,7 +279,7 @@ while IFS= read -r -d '' item; do
   elif [ -d "$item" ]; then
     :
   elif [ -f "$item" ]; then
-    if find "$item" -prune -links +1 -print | grep -q .; then
+    if ! ordinary_file "$item"; then
       unsafe_messages+=("'$source_relative' is a link or reparse point")
       unsafe_count=$((unsafe_count + 1))
       continue
@@ -420,7 +432,7 @@ for ((i = 0; i < content_count; i++)); do
   candidate="$transaction_dir/candidate-$i"
   classification_file="$transaction_dir/classification-$i"
 
-  if [ -L "$file" ] || [ ! -f "$file" ]; then
+  if ! ordinary_file "$file"; then
     die "content source '${file#"$repo_root"/}' changed during input preflight; refusing to read through it."
   fi
   if ! LC_ALL=C od -An -v -tu1 "$file" | awk '
@@ -668,7 +680,7 @@ transaction_active=1
 # 1) Apply the staged content plan. Both initializers are skipped because they
 #    carry the literal token strings as search keys.
 for ((i = 0; i < content_plan_count; i++)); do
-  if [ -L "${content_plan_files[i]}" ] || [ ! -f "${content_plan_files[i]}" ]; then
+  if ! ordinary_file "${content_plan_files[i]}"; then
     die "content source '${content_plan_files[i]#"$repo_root"/}' changed after preflight; refusing to write through it."
   fi
   # cp can fail after truncating the target. Include this verified path in the

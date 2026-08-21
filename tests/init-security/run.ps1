@@ -563,6 +563,57 @@ function Test-RequiredBinaryPreflightFailure(
         "$kind initializer changed earlier files before rejecting required binary data"
 }
 
+function Test-PostPreflightHardLinkRollback(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-post-preflight-hard-link"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+
+    $earlierRelative = '.initializer-post-preflight-content/a-earlier.txt'
+    $lateRelative = '.initializer-post-preflight-content/z-late.txt'
+    $earlierOriginal = 'earlier __Description__ must be restored'
+    Add-TextFixture $copyRoot $earlierRelative $earlierOriginal
+    Add-TextFixture $copyRoot $lateRelative 'late __Description__ must never reach an external inode'
+    $earlierPath = Join-Path $copyRoot $earlierRelative
+    $latePath = Join-Path $copyRoot $lateRelative
+
+    $externalPath = Join-Path $script:TempRoot "$kind-post-preflight-hard-link-target.txt"
+    $externalContent = 'external __Description__ target must remain unchanged'
+    [IO.File]::WriteAllText($externalPath, $externalContent, [Text.UTF8Encoding]::new($false))
+
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Hard Link Race Tester' 'hard-link-race@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT'] = '1'
+    $result = Invoke-CapturedProcessAtCheckpoint `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment `
+        'INITIALIZER_TEST_PREFLIGHT_READY' `
+        {
+            Remove-Item -LiteralPath $latePath -Force
+            [void](New-Item -ItemType HardLink -Path $latePath -Target $externalPath -ErrorAction Stop)
+        }
+
+    if (-not $result.CheckpointObserved) {
+        throw "$kind initializer did not expose the deterministic post-preflight hard-link checkpoint"
+    }
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a content source replaced by a hard link after preflight"
+    }
+    Assert-DiagnosticContains $result `
+        "source '$lateRelative' changed after preflight; refusing to write through it." `
+        "$kind initializer returned an unclear post-preflight hard-link diagnostic."
+    Assert-Equal `
+        ([IO.File]::ReadAllText($externalPath)) `
+        $externalContent `
+        "$kind initializer changed an external target through a post-preflight hard link"
+    Assert-Equal `
+        ([IO.File]::ReadAllText($earlierPath)) `
+        $earlierOriginal `
+        "$kind initializer did not roll back content written before rejecting a post-preflight hard link"
+}
+
 function Test-CollisionFailure(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [string]$caseName,
@@ -1346,9 +1397,10 @@ try {
     foreach ($kind in @('powershell', 'posix')) {
         Test-LinkPreflightFailure $kind
         Test-RequiredBinaryPreflightFailure $kind
+        Test-PostPreflightHardLinkRollback $kind
     }
     if ($ContentSafetyOnly) {
-        Write-Host 'Initializer large-text, binary, unsupported-data, and link checks passed.' -ForegroundColor Green
+        Write-Host 'Initializer large-text, binary, unsupported-data, and link safety checks passed.' -ForegroundColor Green
         return
     }
 
