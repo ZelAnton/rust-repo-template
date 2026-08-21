@@ -14,6 +14,7 @@ UNRELEASED_RE = re.compile(
 )
 SECTION_HEADER_RE = re.compile(r"^###[ \t]+\S")
 BULLET_MARKER_RE = re.compile(r"^-(?:$|(?P<padding>[ \t]+)(?P<content>\S.*)?)$")
+CHECK_EMPTY_EXIT = 3
 
 
 def _advance_column(column: int, whitespace: str) -> int:
@@ -139,17 +140,37 @@ def extract_release_notes(changelog: str) -> str:
     return "\n\n".join(sections)
 
 
+def _read_changelog(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as error:
+        print(f"::error::Could not read {path}: {error}", file=sys.stderr)
+        return None
+
+
 def main(argv: Sequence[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--check":
+        changelog = _read_changelog(Path(argv[2]))
+        if changelog is None:
+            return 2
+        # A dedicated status keeps Python/import failures (normally exit 1)
+        # distinct from the one state where auto-fill is allowed.
+        return 0 if extract_release_notes(changelog) else CHECK_EMPTY_EXIT
+
     if len(argv) != 3:
         print(
-            f"usage: {Path(argv[0]).name} CHANGELOG OUTPUT",
+            f"usage: {Path(argv[0]).name} CHANGELOG OUTPUT\n"
+            f"       {Path(argv[0]).name} --check CHANGELOG",
             file=sys.stderr,
         )
         return 2
 
     changelog_path = Path(argv[1])
     output_path = Path(argv[2])
-    result = extract_release_notes(changelog_path.read_text(encoding="utf-8"))
+    changelog = _read_changelog(changelog_path)
+    if changelog is None:
+        return 2
+    result = extract_release_notes(changelog)
     if not result:
         print(
             "::error::[Unreleased] section in CHANGELOG.md is empty. "
@@ -158,7 +179,11 @@ def main(argv: Sequence[str]) -> int:
         )
         return 1
 
-    output_path.write_text(result + "\n", encoding="utf-8")
+    try:
+        output_path.write_text(result + "\n", encoding="utf-8")
+    except OSError as error:
+        print(f"::error::Could not write {output_path}: {error}", file=sys.stderr)
+        return 2
     print("----- release notes -----")
     print(result)
     print("-------------------------")

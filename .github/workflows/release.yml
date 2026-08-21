@@ -158,6 +158,20 @@ jobs:
           PREV_TAG: ${{ steps.version.outputs.prev_tag }}
         run: |
           set -euo pipefail
+
+          # Reuse the exact parser that later renders the release notes. Exit 3
+          # means a valid changelog has no real notes; any other failure remains
+          # fatal instead of being mistaken for permission to overwrite it.
+          if python3 tests/release-notes/extract_release_notes.py --check CHANGELOG.md; then
+            echo "[Unreleased] already has manual entries; skipping auto-fill."
+            exit 0
+          else
+            notes_status=$?
+            if [ "$notes_status" -ne 3 ]; then
+              exit "$notes_status"
+            fi
+          fi
+
           python3 <<'PY'
           import os
           import pathlib
@@ -178,12 +192,6 @@ jobs:
           if not m:
               print("::error::Could not find '## [Unreleased]' header in CHANGELOG.md", file=sys.stderr)
               sys.exit(1)
-
-          body = m.group(1)
-          has_real_bullets = any(re.match(r"^-\s+\S", ln) for ln in body.splitlines())
-          if has_real_bullets:
-              print("[Unreleased] already has manual entries; skipping auto-fill.")
-              sys.exit(0)
 
           tag_exists = bool(prev_tag) and subprocess.run(
               ["git", "rev-parse", "--verify", prev_tag], capture_output=True
