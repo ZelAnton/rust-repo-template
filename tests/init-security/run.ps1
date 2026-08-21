@@ -4,7 +4,8 @@ param(
     [switch]$CollisionOnly,
     [switch]$RaceOnly,
     [switch]$ReopenedOnly,
-    [switch]$ContentSafetyOnly
+    [switch]$ContentSafetyOnly,
+    [switch]$GitFileOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -411,6 +412,59 @@ function Assert-HiddenInitializerFixtureUpdated(
             'external __ProjectName__ __Description__' `
             "$description read or changed a hard-link target from excluded directory $($fixture.Directory)"
     }
+}
+
+function Test-GitFileExclusion(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-gitfile"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+
+    $gitFilePath = Join-Path $copyRoot '.git'
+    $adminPath = Join-Path $script:TempRoot "$kind-__ProjectName__-admin"
+    $gitInit = Invoke-CapturedProcess `
+        'git' `
+        @('init', '-q', '--separate-git-dir', $adminPath, $copyRoot) `
+        $script:TempRoot
+    Assert-ProcessSucceeded $gitInit "gitfile fixture setup for $kind initializer"
+
+    $gitFileContent = [IO.File]::ReadAllText($gitFilePath)
+    $externalPath = Join-Path $script:TempRoot "$kind-gitfile-external.txt"
+    [IO.File]::WriteAllText(
+        $externalPath,
+        $gitFileContent,
+        (New-Object Text.UTF8Encoding($false))
+    )
+    Remove-Item -LiteralPath $gitFilePath -Force
+    [void](New-Item `
+        -ItemType HardLink `
+        -Path $gitFilePath `
+        -Target $externalPath `
+        -ErrorAction Stop)
+
+    $invocation = Get-InitializerInvocation `
+        $kind `
+        $copyRoot `
+        'Gitfile Fixture' `
+        'gitfile@example.com'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind initializer with .git gitfile"
+
+    if (-not (Test-Path -LiteralPath $gitFilePath -PathType Leaf)) {
+        throw "$kind initializer changed the excluded .git gitfile path"
+    }
+    Assert-Equal `
+        ([IO.File]::ReadAllText($gitFilePath)) `
+        $gitFileContent `
+        "$kind initializer changed the excluded .git gitfile"
+    Assert-Equal `
+        ([IO.File]::ReadAllText($externalPath)) `
+        $gitFileContent `
+        "$kind initializer read or changed the excluded .git gitfile hard-link target"
 }
 
 function Add-NestedRenameFixture([string]$copyRoot) {
@@ -1477,10 +1531,19 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    if ($GitFileOnly) {
+        foreach ($kind in @('powershell', 'posix')) {
+            Test-GitFileExclusion $kind
+        }
+        Write-Host 'Initializer .git gitfile exclusion checks passed.' -ForegroundColor Green
+        return
+    }
+
     $psContent = Test-SafeContentSuccess powershell
     $shContent = Test-SafeContentSuccess posix
     Assert-Equal $shContent $psContent 'Initializers produced different safe-content bytes'
     foreach ($kind in @('powershell', 'posix')) {
+        Test-GitFileExclusion $kind
         Test-LinkPreflightFailure $kind
         Test-RequiredBinaryPreflightFailure $kind
         Test-PostPreflightHardLinkRollback $kind

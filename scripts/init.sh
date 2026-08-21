@@ -248,7 +248,7 @@ if [ "$traversal_failure" = content ] || [ "$traversal_failure" = rename ]; then
   printf '%s\0' "$repo_root/Cargo.toml" > "$inventory_manifest"
   inventory_find_status=73
 elif find "$repo_root" \
-    \( -type d \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
+    \( \( -name .git -o -name .jj -o -name target \) -o -path "$security_tests" \) -prune \
     -o -print0 > "$inventory_manifest"; then
   inventory_find_status=0
 else
