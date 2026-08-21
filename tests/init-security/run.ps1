@@ -417,6 +417,49 @@ function Test-RejectedTomlControl(
         "$kind initializer created temporary transaction artifacts before rejecting TOML control $codePoint ($caseName)"
 }
 
+function Test-ShouldRunTomlSuite([bool]$tomlOnly, [bool]$hasOtherSelector) {
+    $tomlOnly -or -not $hasOtherSelector
+}
+
+function Test-TomlSuiteRoutingContract {
+    Assert-Equal `
+        (Test-ShouldRunTomlSuite -tomlOnly:$false -hasOtherSelector:$false) `
+        $true `
+        'Default init-security routing omitted the TOML regression suite'
+    Assert-Equal `
+        (Test-ShouldRunTomlSuite -tomlOnly:$true -hasOtherSelector:$false) `
+        $true `
+        'Focused TOML routing omitted the TOML regression suite'
+    Assert-Equal `
+        (Test-ShouldRunTomlSuite -tomlOnly:$false -hasOtherSelector:$true) `
+        $false `
+        'A non-TOML focused selector unexpectedly enabled the TOML regression suite'
+}
+
+function Invoke-TomlBasicStringSuite {
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-TomlBasicStringRoundTrip `
+            $kind `
+            'quotes-backslashes' `
+            'quoted "value" with path\segment' `
+            'owner"quoted\path'
+        Test-TomlBasicStringRoundTrip `
+            $kind `
+            'short-controls' `
+            "line one`nline two`rreturn`ttab`bbackspace`fform-feed" `
+            "owner`ttab"
+        foreach ($case in @(
+            @{ Name = 'vertical-tab'; Character = [char]0x0b; CodePoint = 'U+000B' },
+            @{ Name = 'escape'; Character = [char]0x1b; CodePoint = 'U+001B' },
+            @{ Name = 'delete'; Character = [char]0x7f; CodePoint = 'U+007F' }
+        )) {
+            Test-RejectedTomlControl `
+                $kind $case.Name $case.Character $case.CodePoint
+        }
+    }
+    Write-Host 'Initializer TOML basic-string parity checks passed.' -ForegroundColor Green
+}
+
 function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]$description) {
     foreach ($relativePath in @(
         'tests/init-security',
@@ -1779,29 +1822,21 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    $hasOtherSelector = [bool](
+        $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
+        $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly
+    )
+    $runTomlSuite = Test-ShouldRunTomlSuite `
+        -tomlOnly:$TomlOnly `
+        -hasOtherSelector:$hasOtherSelector
+    Test-TomlSuiteRoutingContract
+
     if ($TomlOnly) {
         Test-DiagnosticNormalization
-        foreach ($kind in @('powershell', 'posix')) {
-            Test-TomlBasicStringRoundTrip `
-                $kind `
-                'quotes-backslashes' `
-                'quoted "value" with path\segment' `
-                'owner"quoted\path'
-            Test-TomlBasicStringRoundTrip `
-                $kind `
-                'short-controls' `
-                "line one`nline two`rreturn`ttab`bbackspace`fform-feed" `
-                "owner`ttab"
-            foreach ($case in @(
-                @{ Name = 'vertical-tab'; Character = [char]0x0b; CodePoint = 'U+000B' },
-                @{ Name = 'escape'; Character = [char]0x1b; CodePoint = 'U+001B' },
-                @{ Name = 'delete'; Character = [char]0x7f; CodePoint = 'U+007F' }
-            )) {
-                Test-RejectedTomlControl `
-                    $kind $case.Name $case.Character $case.CodePoint
-            }
+        if (-not $runTomlSuite) {
+            throw 'Internal routing error: -TomlOnly did not select the TOML regression suite'
         }
-        Write-Host 'Initializer TOML basic-string parity checks passed.' -ForegroundColor Green
+        Invoke-TomlBasicStringSuite
         return
     }
 
@@ -1900,6 +1935,10 @@ try {
     }
 
     Test-DiagnosticNormalization
+
+    if ($runTomlSuite) {
+        Invoke-TomlBasicStringSuite
+    }
 
     Test-PowerShellDuplicateGitPathDiscovery
 
