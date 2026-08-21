@@ -263,6 +263,20 @@ function Get-RelativeDisplayPath([string]$path) {
     [IO.Path]::GetRelativePath($repoRoot, [IO.Path]::GetFullPath($path)).Replace('\', '/')
 }
 
+function Test-OrdinaryFile([string]$path) {
+    try {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        return (
+            $item -is [IO.FileInfo] -and
+            -not $item.PSIsContainer -and
+            -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and
+            -not $item.LinkType
+        )
+    } catch {
+        return $false
+    }
+}
+
 # Directory.CreateDirectory treats an existing directory as success. The native
 # primitives preserve mkdir's exclusive-create result, which is what lets the
 # filesystem decide case, Unicode, normalization, and per-directory aliases
@@ -363,17 +377,58 @@ function Remove-EmptyOrdinaryDirectory([string]$path, [string]$description) {
 
 Write-Host "==> Initializing template as '$crateSafe'" -ForegroundColor Cyan
 
-# Build every mutation plan before the first write. In particular, a path
-# collision must not be discovered after content replacement has already
-# changed the user's checkout.
+# Build and validate the complete repository inventory before the first
+# repository mutation. Traversal is manual so excluded directories are pruned
+# and a reparse point is classified without ever enumerating its target.
 $siblingSh = Join-Path $PSScriptRoot 'init.sh'
+$repositoryItems = [Collections.Generic.List[IO.FileSystemInfo]]::new()
+$repositoryFiles = [Collections.Generic.List[IO.FileInfo]]::new()
+$unsafeEntries = [Collections.Generic.List[string]]::new()
+$pendingDirectories = [Collections.Generic.Stack[string]]::new()
+$pendingDirectories.Push($repoRoot)
+
+while ($pendingDirectories.Count -gt 0) {
+    $directory = $pendingDirectories.Pop()
+    try {
+        $children = Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop
+    } catch {
+        throw "Could not traverse the complete repository tree at '$((Get-RelativeDisplayPath $directory))'; no files were changed: $($_.Exception.Message)"
+    }
+
+    foreach ($item in $children) {
+        if (Test-Excluded $item.FullName) {
+            continue
+        }
+        $relativePath = Get-RelativeDisplayPath $item.FullName
+        if (
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            $item.LinkType
+        ) {
+            $unsafeEntries.Add("'$relativePath' is a link or reparse point")
+            continue
+        }
+        if ($item.PSIsContainer) {
+            $repositoryItems.Add($item)
+            $pendingDirectories.Push($item.FullName)
+            continue
+        }
+        if ($item -is [IO.FileInfo]) {
+            $repositoryItems.Add($item)
+            $repositoryFiles.Add($item)
+            continue
+        }
+        $unsafeEntries.Add("'$relativePath' is not a regular file or directory")
+    }
+}
+
+if ($unsafeEntries.Count -gt 0) {
+    throw "Initialization input preflight rejected unsafe filesystem entries; no files were changed:`n  $($unsafeEntries -join "`n  ")"
+}
 
 # Deepest paths run first so child renames do not invalidate parent sources.
 # Ordinal relative-path ordering makes equal-depth plans reproducible.
 $renamePlan = [Collections.Generic.List[object]]::new()
-foreach ($item in (Get-ChildItem -Path $repoRoot -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.Name.Contains('__ProjectName__')
-})) {
+foreach ($item in ($repositoryItems | Where-Object { $_.Name.Contains('__ProjectName__') })) {
     $relativeSource = Get-RelativeDisplayPath $item.FullName
     $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
     $destination = Join-Path (Split-Path -Parent $item.FullName) $newName
@@ -399,6 +454,77 @@ $claudeSettings = Join-Path $repoRoot '.claude/settings.json'
 $activateClaudeSettings = Test-PathEntryExists $claudeTemplate
 if ($activateClaudeSettings -and -not (Test-Path -LiteralPath $claudeTemplate -PathType Leaf)) {
     throw "Expected .claude/settings.json.template to be a file before initialization."
+}
+
+# The two initializers share one byte-level text contract: only ordinary files
+# containing valid UTF-8 and no NUL byte are eligible for token replacement.
+# Binary (NUL-containing) and unsupported (invalid UTF-8) regular files are
+# deliberately left byte-for-byte unchanged. Required template control files
+# must satisfy the contract so initialization cannot silently produce a broken
+# repository.
+$strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+$requiredTextPaths = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+)
+[void]$requiredTextPaths.Add($releaseWorkflowPath)
+[void]$requiredTextPaths.Add($ciWorkflowPath)
+[void]$requiredTextPaths.Add([IO.Path]::GetFullPath((Join-Path $repoRoot 'Cargo.toml')))
+$contentPlan = [Collections.Generic.List[object]]::new()
+foreach ($file in ($repositoryFiles | Sort-Object FullName)) {
+    if ($file.FullName -eq $selfPath -or $file.FullName -eq $siblingSh) {
+        continue
+    }
+
+    $canonicalFile = [IO.Path]::GetFullPath($file.FullName)
+    if (-not (Test-OrdinaryFile $file.FullName)) {
+        throw "Content source '$((Get-RelativeDisplayPath $file.FullName))' changed during input preflight; refusing to read through it."
+    }
+    try {
+        $originalBytes = [IO.File]::ReadAllBytes($file.FullName)
+    } catch {
+        throw "Could not read '$((Get-RelativeDisplayPath $file.FullName))' during input preflight; no files were changed: $($_.Exception.Message)"
+    }
+
+    $binary = [Array]::IndexOf[byte]($originalBytes, [byte]0) -ge 0
+    $text = $null
+    if (-not $binary) {
+        try {
+            $text = $strictUtf8.GetString($originalBytes)
+        } catch [Text.DecoderFallbackException] { }
+    }
+    if ($binary -or $null -eq $text) {
+        if ($requiredTextPaths.Contains($canonicalFile)) {
+            $classification = if ($binary) { 'binary (contains NUL)' } else { 'unsupported (not valid UTF-8)' }
+            throw "required template file '$((Get-RelativeDisplayPath $file.FullName))' is $classification; no files were changed."
+        }
+        continue
+    }
+
+    $new = $text
+    $map = if ($canonicalFile.Equals($releaseWorkflowPath, $pathComparison)) {
+        $releaseWorkflowReplacements
+    } elseif ($tomlFileExtensions -contains $file.Extension) {
+        $tomlReplacements
+    } else {
+        $replacements
+    }
+    foreach ($key in $map.Keys) {
+        $new = $new.Replace($key, $map[$key])
+    }
+    if ($canonicalFile.Equals($ciWorkflowPath, $pathComparison)) {
+        $templateOnlyMatches = $templateOnlyCiPattern.Matches($new)
+        if ($templateOnlyMatches.Count -ne 1) {
+            throw "Expected exactly one template-only init-security block in .github/workflows/ci.yml; found $($templateOnlyMatches.Count)."
+        }
+        $new = $templateOnlyCiPattern.Replace($new, '', 1)
+    }
+    if ($new -cne $text) {
+        $contentPlan.Add([pscustomobject]@{
+            Path = $file.FullName
+            ContentBytes = $strictUtf8.GetBytes($new)
+            OriginalBytes = $originalBytes
+        })
+    }
 }
 
 $collisions = [Collections.Generic.List[string]]::new()
@@ -532,42 +658,6 @@ if ($collisions.Count -gt 0) {
     throw "initialization collision preflight failed; no files were changed:`n  $($collisions -join "`n  ")"
 }
 
-# Validate and materialize the content plan only in memory. Any malformed
-# template-only CI markers or unreadable file still fail before the first write.
-$files = Get-ChildItem -Path $repoRoot -File -Recurse -Force | Where-Object {
-    -not (Test-Excluded $_.FullName) -and $_.FullName -ne $selfPath -and $_.FullName -ne $siblingSh
-}
-$contentPlan = [Collections.Generic.List[object]]::new()
-foreach ($file in $files) {
-    $text = [System.IO.File]::ReadAllText($file.FullName)
-    $new = $text
-    $canonicalFile = [IO.Path]::GetFullPath($file.FullName)
-    $map = if ($canonicalFile.Equals($releaseWorkflowPath, $pathComparison)) {
-        $releaseWorkflowReplacements
-    } elseif ($tomlFileExtensions -contains $file.Extension) {
-        $tomlReplacements
-    } else {
-        $replacements
-    }
-    foreach ($key in $map.Keys) {
-        $new = $new.Replace($key, $map[$key])
-    }
-    if ($canonicalFile.Equals($ciWorkflowPath, $pathComparison)) {
-        $templateOnlyMatches = $templateOnlyCiPattern.Matches($new)
-        if ($templateOnlyMatches.Count -ne 1) {
-            throw "Expected exactly one template-only init-security block in .github/workflows/ci.yml; found $($templateOnlyMatches.Count)."
-        }
-        $new = $templateOnlyCiPattern.Replace($new, '', 1)
-    }
-    if ($new -cne $text) {
-        $contentPlan.Add([pscustomobject]@{
-            Path = $file.FullName
-            Content = $new
-            OriginalBytes = [System.IO.File]::ReadAllBytes($file.FullName)
-        })
-    }
-}
-
 if ($env:INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT -eq '1') {
     [Console]::Out.WriteLine('INITIALIZER_TEST_PREFLIGHT_READY')
     if ($env:INIT_SECURITY_TEST_READY_FILE -and $env:INIT_SECURITY_TEST_RELEASE_FILE) {
@@ -589,18 +679,20 @@ if ($env:INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT -eq '1') {
 # original bytes at their original paths. Race-created destinations are never
 # added to the journal and are therefore never removed by rollback.
 $completedRenames = [Collections.Generic.List[object]]::new()
+$contentRollbackJournal = [Collections.Generic.List[object]]::new()
 $settingsActivated = $false
 try {
     # 1) Replace tokens in file contents. Both initializers are skipped: they
     #    carry the literal token strings as search keys, so substituting inside
     #    them would corrupt the sibling script.
     foreach ($entry in $contentPlan) {
-        # UTF-8 without BOM, LF preserved — matches .gitattributes (eol=lf).
-        [System.IO.File]::WriteAllText(
-            $entry.Path,
-            $entry.Content,
-            (New-Object System.Text.UTF8Encoding($false))
-        )
+        if (-not (Test-OrdinaryFile $entry.Path)) {
+            throw "Content source '$((Get-RelativeDisplayPath $entry.Path))' changed after preflight; refusing to write through it."
+        }
+        # A write can fail after truncating the file, so journal the verified
+        # target immediately before the mutation attempt.
+        $contentRollbackJournal.Add($entry)
+        [IO.File]::WriteAllBytes($entry.Path, $entry.ContentBytes)
     }
     Write-Host "    Updated contents in $($contentPlan.Count) file(s)." -ForegroundColor DarkGray
 
@@ -656,8 +748,11 @@ try {
         }
     }
 
-    foreach ($entry in $contentPlan) {
+    foreach ($entry in $contentRollbackJournal) {
         try {
+            if (-not (Test-OrdinaryFile $entry.Path)) {
+                throw 'content path is no longer an ordinary file; refusing to restore through it'
+            }
             [System.IO.File]::WriteAllBytes($entry.Path, $entry.OriginalBytes)
         } catch {
             $rollbackErrors.Add("content '$((Get-RelativeDisplayPath $entry.Path))': $($_.Exception.Message)")

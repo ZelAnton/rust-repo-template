@@ -3,7 +3,8 @@
 param(
     [switch]$CollisionOnly,
     [switch]$RaceOnly,
-    [switch]$ReopenedOnly
+    [switch]$ReopenedOnly,
+    [switch]$ContentSafetyOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -437,6 +438,129 @@ function Test-SuccessfulInitialization(
     Assert-ProcessSucceeded $verification "$kind generated workflow verification ($source $caseName)"
 
     [IO.File]::ReadAllText((Join-Path $copyRoot '.github/workflows/release.yml'))
+}
+
+function Test-SafeContentSuccess(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-safe-content"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+
+    $largePath = Join-Path $copyRoot '.initializer-content/large.txt'
+    $largeOriginal = "large-prefix-__ProjectName__-" + ('x' * 200000) + '-__Description__-large-suffix'
+    Add-TextFixture $copyRoot '.initializer-content/large.txt' $largeOriginal
+
+    $binaryPath = Join-Path $copyRoot '.initializer-content/binary.bin'
+    $binaryBytes = [Collections.Generic.List[byte]]::new()
+    $binaryBytes.AddRange([Text.Encoding]::UTF8.GetBytes('binary-__ProjectName__-'))
+    $binaryBytes.Add(0)
+    $binaryBytes.AddRange([Text.Encoding]::UTF8.GetBytes('-__Description__-tail'))
+    [IO.File]::WriteAllBytes($binaryPath, $binaryBytes.ToArray())
+    $binaryHash = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash
+
+    $unsupportedPath = Join-Path $copyRoot '.initializer-content/unsupported.dat'
+    $unsupportedBytes = [byte[]](0x66, 0x6f, 0x80, 0xff, 0x5f, 0x5f, 0x59, 0x65, 0x61, 0x72, 0x5f, 0x5f)
+    [IO.File]::WriteAllBytes($unsupportedPath, $unsupportedBytes)
+    $unsupportedHash = (Get-FileHash -LiteralPath $unsupportedPath -Algorithm SHA256).Hash
+
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Content Tester' 'content@example.com'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind safe-content initializer"
+
+    $largeExpected = $largeOriginal.Replace('__ProjectName__', 'init-security').Replace(
+        '__Description__',
+        'Initializer security regression fixture'
+    )
+    Assert-Equal `
+        ([IO.File]::ReadAllText($largePath, [Text.UTF8Encoding]::new($false, $true))) `
+        $largeExpected `
+        "$kind initializer lost data while replacing a 200000-byte text file"
+    Assert-Equal `
+        ((Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash) `
+        $binaryHash `
+        "$kind initializer changed a binary file containing template token bytes"
+    Assert-Equal `
+        ((Get-FileHash -LiteralPath $unsupportedPath -Algorithm SHA256).Hash) `
+        $unsupportedHash `
+        "$kind initializer changed an invalid-UTF-8 regular file"
+
+    @(
+        (Get-FileHash -LiteralPath $largePath -Algorithm SHA256).Hash,
+        (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash,
+        (Get-FileHash -LiteralPath $unsupportedPath -Algorithm SHA256).Hash
+    ) -join ':'
+}
+
+function Test-LinkPreflightFailure(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-link-input"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-content/earlier.txt' 'earlier __Description__ must remain unchanged'
+
+    $externalPath = Join-Path $script:TempRoot "$kind-external-link-target.txt"
+    $externalContent = 'external __Description__ target must remain unchanged'
+    [IO.File]::WriteAllText($externalPath, $externalContent, [Text.UTF8Encoding]::new($false))
+    $linkPath = Join-Path $copyRoot '.initializer-content/file-link.txt'
+    try {
+        [void](New-Item -ItemType SymbolicLink -Path $linkPath -Target $externalPath -ErrorAction Stop)
+    } catch {
+        # Windows may require an elevated token for symbolic links. A hard link
+        # exercises the same no-write-through contract without that privilege.
+        [void](New-Item -ItemType HardLink -Path $linkPath -Target $externalPath -ErrorAction Stop)
+    }
+
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Link Tester' 'link@example.com'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a file link in the repository input tree"
+    }
+    Assert-DiagnosticContains $result `
+        "'.initializer-content/file-link.txt' is a link or reparse point" `
+        "$kind initializer returned an unclear file-link preflight diagnostic."
+    Assert-Equal `
+        ([IO.File]::ReadAllText($externalPath)) `
+        $externalContent `
+        "$kind initializer changed a target outside the repository through a file link"
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer partially initialized files before rejecting a file link"
+}
+
+function Test-RequiredBinaryPreflightFailure(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-required-binary"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-content/earlier.txt' 'earlier __Description__ must remain unchanged'
+    $cargoPath = Join-Path $copyRoot 'Cargo.toml'
+    $cargoBytes = [Collections.Generic.List[byte]]::new()
+    $cargoBytes.AddRange([IO.File]::ReadAllBytes($cargoPath))
+    $cargoBytes.Add(0)
+    $cargoBytes.AddRange([Text.Encoding]::UTF8.GetBytes('__Description__'))
+    [IO.File]::WriteAllBytes($cargoPath, $cargoBytes.ToArray())
+
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Binary Tester' 'binary@example.com'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted binary data in required Cargo.toml"
+    }
+    Assert-DiagnosticContains $result `
+        "required template file 'Cargo.toml' is binary (contains NUL); no files were changed" `
+        "$kind initializer returned an unclear required-binary diagnostic."
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer changed earlier files before rejecting required binary data"
 }
 
 function Test-CollisionFailure(
@@ -1216,6 +1340,18 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    $psContent = Test-SafeContentSuccess powershell
+    $shContent = Test-SafeContentSuccess posix
+    Assert-Equal $shContent $psContent 'Initializers produced different safe-content bytes'
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-LinkPreflightFailure $kind
+        Test-RequiredBinaryPreflightFailure $kind
+    }
+    if ($ContentSafetyOnly) {
+        Write-Host 'Initializer large-text, binary, unsupported-data, and link checks passed.' -ForegroundColor Green
+        return
+    }
+
     if ($RaceOnly) {
         foreach ($kind in @('powershell', 'posix')) {
             Test-LateRaceRollback $kind
