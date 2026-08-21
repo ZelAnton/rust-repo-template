@@ -221,29 +221,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Probe the actual destination filesystem. OS-name checks are insufficient for
-# default case-insensitive macOS volumes and case-sensitive Windows directories.
-case_probe_token="$RANDOM-$$"
-case_probe="$repo_root/.initializer-case-probe-$case_probe_token.tmp"
-case_probe_alias="$repo_root/.INITIALIZER-CASE-PROBE-$case_probe_token.TMP"
-if ! (set -o noclobber; : > "$case_probe") 2>/dev/null; then
-  die "could not create filesystem case-sensitivity probe."
-fi
-filesystem_case_insensitive=0
-if [ "$case_probe" -ef "$case_probe_alias" ]; then
-  filesystem_case_insensitive=1
-fi
-rm -f "$case_probe"
-
-collision_key() {
-  if ((filesystem_case_insensitive == 1)); then
-    key="$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]'; printf x)"
-    printf '%s' "${key%x}"
-  else
-    printf '%s' "$1"
-  fi
-}
-
 # Build every mutation plan before the first write. The arrays deliberately use
 # Bash 3-compatible indexed arrays so the initializer retains macOS support.
 content_manifest="$transaction_dir/content-files"
@@ -363,41 +340,89 @@ if entry_exists "$claude_template"; then
 fi
 
 collision_messages=()
-planned_targets=()
-planned_target_sources=()
 collision_count=0
-planned_target_count=0
-for ((i = 0; i < rename_count; i++)); do
-  if entry_exists "${rename_destinations[i]}"; then
-    collision_messages+=("destination '${rename_destination_relatives[i]}' already exists (source '${rename_source_relatives[i]}')")
-    collision_count=$((collision_count + 1))
+reservation_paths=()
+reservation_relatives=()
+reservation_sources=()
+reservation_markers=()
+reservation_count=0
+
+reserve_destination() {
+  reservation_path="$1"
+  reservation_relative="$2"
+  reservation_source="$3"
+  reservation_marker="rust-template-init-reservation:${transaction_dir##*/}:$$:$reservation_count"
+
+  # Noclobber creation at the exact absent target delegates case, Unicode
+  # normalization, and per-directory equivalence to the filesystem that owns
+  # this destination. A repo-root probe and ASCII folding cannot do that.
+  if (set -o noclobber; printf '%s' "$reservation_marker" > "$reservation_path") 2>/dev/null; then
+    reservation_paths[reservation_count]="$reservation_path"
+    reservation_relatives[reservation_count]="$reservation_relative"
+    reservation_sources[reservation_count]="$reservation_source"
+    reservation_markers[reservation_count]="$reservation_marker"
+    reservation_count=$((reservation_count + 1))
+    return
   fi
-  target_key="$(collision_key "${rename_destinations[i]}")"
-  for ((j = 0; j < planned_target_count; j++)); do
-    if [ "${planned_targets[j]}" = "$target_key" ]; then
-      collision_messages+=("destination '${rename_destination_relatives[i]}' is planned by multiple sources: '${planned_target_sources[j]}', '${rename_source_relatives[i]}'")
-      collision_count=$((collision_count + 1))
+
+  reservation_owner=-1
+  if [ -f "$reservation_path" ] && [ ! -L "$reservation_path" ]; then
+    if existing_marker="$(cat "$reservation_path"; read_status=$?; ((read_status == 0)) || exit "$read_status"; printf x)"; then
+      existing_marker="${existing_marker%x}"
+      for ((reservation_i = 0; reservation_i < reservation_count; reservation_i++)); do
+        if [ "${reservation_markers[reservation_i]}" = "$existing_marker" ]; then
+          reservation_owner="$reservation_i"
+          break
+        fi
+      done
     fi
-  done
-  planned_targets[planned_target_count]="$target_key"
-  planned_target_sources[planned_target_count]="${rename_source_relatives[i]}"
-  planned_target_count=$((planned_target_count + 1))
+  fi
+
+  if ((reservation_owner >= 0)); then
+    collision_messages+=("destination '$reservation_relative' is planned by multiple sources: '${reservation_sources[reservation_owner]}', '$reservation_source'")
+  elif entry_exists "$reservation_path"; then
+    collision_messages+=("destination '$reservation_relative' already exists (source '$reservation_source')")
+  else
+    collision_messages+=("destination '$reservation_relative' could not be reserved; filesystem equivalence could not be established (source '$reservation_source')")
+  fi
+  collision_count=$((collision_count + 1))
+}
+
+for ((i = 0; i < rename_count; i++)); do
+  reserve_destination \
+    "${rename_destinations[i]}" \
+    "${rename_destination_relatives[i]}" \
+    "${rename_source_relatives[i]}"
 done
 if ((activate_claude_settings == 1)); then
   settings_source_relative="${claude_template#"$repo_root"/}"
   settings_destination_relative="${claude_settings#"$repo_root"/}"
-  if entry_exists "$claude_settings"; then
-    collision_messages+=("destination '$settings_destination_relative' already exists (source '$settings_source_relative')")
-    collision_count=$((collision_count + 1))
-  fi
-  settings_target_key="$(collision_key "$claude_settings")"
-  for ((j = 0; j < planned_target_count; j++)); do
-    if [ "${planned_targets[j]}" = "$settings_target_key" ]; then
-      collision_messages+=("destination '$settings_destination_relative' is planned by multiple sources: '${planned_target_sources[j]}', '$settings_source_relative'")
-      collision_count=$((collision_count + 1))
-    fi
-  done
+  reserve_destination "$claude_settings" "$settings_destination_relative" "$settings_source_relative"
 fi
+
+# Remove only ordinary files that still carry the nonce written by this
+# initializer. A missing, replaced, symlinked, or unreadable reservation is
+# left untouched and aborts before any template content is changed.
+reservation_cleanup_failed=0
+for ((i = 0; i < reservation_count; i++)); do
+  current_marker=""
+  if [ -f "${reservation_paths[i]}" ] && [ ! -L "${reservation_paths[i]}" ] &&
+     current_marker="$(cat "${reservation_paths[i]}"; read_status=$?; ((read_status == 0)) || exit "$read_status"; printf x)"; then
+    current_marker="${current_marker%x}"
+  fi
+  if [ "$current_marker" != "${reservation_markers[i]}" ]; then
+    printf "error: destination reservation '%s' changed before cleanup; no template files were changed\n" \
+      "${reservation_relatives[i]}" >&2
+    reservation_cleanup_failed=1
+    continue
+  fi
+  if ! rm -f -- "${reservation_paths[i]}" || entry_exists "${reservation_paths[i]}"; then
+    printf "error: could not clean destination reservation '%s'; no template files were changed\n" \
+      "${reservation_relatives[i]}" >&2
+    reservation_cleanup_failed=1
+  fi
+done
+((reservation_cleanup_failed == 0)) || exit 1
 
 if ((collision_count > 0)); then
   printf '%s\n' 'error: initialization collision preflight failed; no files were changed:' >&2
@@ -556,8 +581,6 @@ echo "    Updated contents in $content_plan_count file(s)."
 
 # 2) Execute the already validated one-to-one rename plan without overwrite.
 for ((i = 0; i < rename_count; i++)); do
-  completed_rename_indices[completed_rename_count]="$i"
-  completed_rename_count=$((completed_rename_count + 1))
   if entry_exists "${rename_destinations[i]}"; then
     die "destination '${rename_destination_relatives[i]}' appeared after preflight; refusing to rename source '${rename_source_relatives[i]}'."
   fi
@@ -565,13 +588,14 @@ for ((i = 0; i < rename_count; i++)); do
      entry_exists "${rename_sources[i]}" || ! entry_exists "${rename_destinations[i]}"; then
     die "non-overwriting rename refused destination '${rename_destination_relatives[i]}' for source '${rename_source_relatives[i]}'."
   fi
+  completed_rename_indices[completed_rename_count]="$i"
+  completed_rename_count=$((completed_rename_count + 1))
   echo "    Renamed ${rename_sources[i]##*/} -> ${rename_destinations[i]##*/}"
 done
 
 # 3) Activate Claude Code shared settings from the shipped .template (renames
 #    .claude/settings.json.template -> .claude/settings.json).
 if ((activate_claude_settings == 1)); then
-  settings_was_activated=1
   if entry_exists "$claude_settings"; then
     die "destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
   fi
@@ -579,6 +603,7 @@ if ((activate_claude_settings == 1)); then
      ! entry_exists "$claude_settings"; then
     die "non-overwriting settings activation refused destination '.claude/settings.json'."
   fi
+  settings_was_activated=1
   echo "    Activated .claude/settings.json"
 fi
 

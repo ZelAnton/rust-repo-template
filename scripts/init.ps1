@@ -185,35 +185,6 @@ Assert-ReleaseIdentityValue -parameterName 'AuthorEmail' -value $AuthorEmail
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $selfPath = $PSCommandPath
 
-function Test-FileSystemCaseInsensitive([string]$root) {
-    # OS checks are insufficient: macOS is commonly case-insensitive, while a
-    # Windows directory may explicitly enable case-sensitive names. Probe the
-    # directory that owns the planned destinations and remove the probe before
-    # building any mutation plan.
-    $leaf = ".initializer-case-probe-$([guid]::NewGuid().ToString('N')).tmp"
-    $probe = Join-Path $root $leaf.ToLowerInvariant()
-    $alias = Join-Path $root $leaf.ToUpperInvariant()
-    $stream = $null
-    try {
-        $stream = [IO.File]::Open(
-            $probe,
-            [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write,
-            [IO.FileShare]::None
-        )
-        $stream.Dispose()
-        $stream = $null
-        return Test-Path -LiteralPath $alias
-    } finally {
-        if ($null -ne $stream) { $stream.Dispose() }
-        if (Test-Path -LiteralPath $probe) {
-            Remove-Item -LiteralPath $probe -Force
-        }
-    }
-}
-
-$fileSystemCaseInsensitive = Test-FileSystemCaseInsensitive $repoRoot
-
 $replacements = [ordered]@{
     '__ProjectName__' = $crateSafe
     '__Author__'      = $Author
@@ -245,11 +216,7 @@ $ciWorkflowPath = [IO.Path]::GetFullPath(
 $templateSecurityTestsPath = [IO.Path]::GetFullPath(
     (Join-Path $repoRoot 'tests/init-security')
 )
-$pathComparison = if ($fileSystemCaseInsensitive) {
-    [StringComparison]::OrdinalIgnoreCase
-} else {
-    [StringComparison]::Ordinal
-}
+$pathComparison = [StringComparison]::Ordinal
 $templateOnlyCiPattern = [regex]::new(
     '(?ms)^[ \t]*# template-only-init-security: begin\r?\n.*?^[ \t]*# template-only-init-security: end\r?\n?'
 )
@@ -337,40 +304,115 @@ if ($activateClaudeSettings -and -not (Test-Path -LiteralPath $claudeTemplate -P
 }
 
 $collisions = [Collections.Generic.List[string]]::new()
-$targetComparer = if ($fileSystemCaseInsensitive) {
-    [StringComparer]::OrdinalIgnoreCase
-} else {
+$reservations = [Collections.Generic.List[object]]::new()
+$reservationOwners = [Collections.Generic.Dictionary[string, object]]::new(
     [StringComparer]::Ordinal
+)
+
+function Add-DestinationReservation(
+    [string]$destination,
+    [string]$relativeDestination,
+    [string]$relativeSource
+) {
+    # Create the exact absent destination in its real parent. CreateNew asks the
+    # filesystem itself about case/Unicode equivalence, including per-directory
+    # behavior that a root probe or string fold cannot model.
+    $marker = "rust-template-init-reservation:$([guid]::NewGuid().ToString('N'))"
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $destination,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::Read
+        )
+        $bytes = [Text.Encoding]::UTF8.GetBytes($marker)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        $reservation = [pscustomobject]@{
+            Destination = $destination
+            RelativeDestination = $relativeDestination
+            RelativeSource = $relativeSource
+            Marker = $marker
+        }
+        $reservations.Add($reservation)
+        $reservationOwners[$marker] = $reservation
+        return
+    } catch {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+            $stream = $null
+            try { [IO.File]::Delete($destination) } catch { }
+            throw "Could not write destination reservation '$relativeDestination'; no files were changed."
+        }
+
+        $owner = $null
+        try {
+            $item = Get-Item -LiteralPath $destination -Force -ErrorAction Stop
+            if (
+                -not $item.PSIsContainer -and
+                -not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            ) {
+                $existingMarker = [IO.File]::ReadAllText($destination, [Text.Encoding]::UTF8)
+                [void]$reservationOwners.TryGetValue($existingMarker, [ref]$owner)
+            }
+        } catch { }
+
+        if ($null -ne $owner) {
+            $collisions.Add(
+                "destination '$relativeDestination' is planned by multiple sources: '$($owner.RelativeSource)', '$relativeSource'"
+            )
+        } elseif (Test-PathEntryExists $destination) {
+            $collisions.Add("destination '$relativeDestination' already exists (source '$relativeSource')")
+        } else {
+            $collisions.Add(
+                "destination '$relativeDestination' could not be reserved; filesystem equivalence could not be established (source '$relativeSource')"
+            )
+        }
+    }
 }
-$plannedTargets = [Collections.Generic.Dictionary[string, Collections.Generic.List[string]]]::new($targetComparer)
 
 foreach ($entry in $renamePlan) {
-    if (Test-PathEntryExists $entry.Destination) {
-        $collisions.Add("destination '$($entry.RelativeDestination)' already exists (source '$($entry.RelativeSource)')")
-    }
-    if (-not $plannedTargets.ContainsKey($entry.Destination)) {
-        $plannedTargets[$entry.Destination] = [Collections.Generic.List[string]]::new()
-    }
-    $plannedTargets[$entry.Destination].Add($entry.RelativeSource)
+    Add-DestinationReservation `
+        $entry.Destination `
+        $entry.RelativeDestination `
+        $entry.RelativeSource
 }
 if ($activateClaudeSettings) {
-    $settingsSource = Get-RelativeDisplayPath $claudeTemplate
-    $settingsDestination = Get-RelativeDisplayPath $claudeSettings
-    if (Test-PathEntryExists $claudeSettings) {
-        $collisions.Add("destination '$settingsDestination' already exists (source '$settingsSource')")
-    }
-    if (-not $plannedTargets.ContainsKey($claudeSettings)) {
-        $plannedTargets[$claudeSettings] = [Collections.Generic.List[string]]::new()
-    }
-    $plannedTargets[$claudeSettings].Add($settingsSource)
+    Add-DestinationReservation `
+        $claudeSettings `
+        (Get-RelativeDisplayPath $claudeSettings) `
+        (Get-RelativeDisplayPath $claudeTemplate)
 }
-foreach ($target in $plannedTargets.Keys) {
-    $sources = $plannedTargets[$target]
-    if ($sources.Count -gt 1) {
-        $displayTarget = Get-RelativeDisplayPath $target
-        $displaySources = ($sources | ForEach-Object { "'$_'" }) -join ', '
-        $collisions.Add("destination '$displayTarget' is planned by multiple sources: $displaySources")
+
+# Reservation cleanup is part of preflight, not the mutation transaction. Only
+# an ordinary file carrying our unguessable marker is removed; any mismatch is
+# left untouched and makes initialization fail closed before template writes.
+$reservationCleanupErrors = [Collections.Generic.List[string]]::new()
+foreach ($reservation in $reservations) {
+    try {
+        $item = Get-Item -LiteralPath $reservation.Destination -Force -ErrorAction Stop
+        if (
+            $item.PSIsContainer -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+            [IO.File]::ReadAllText($reservation.Destination, [Text.Encoding]::UTF8) -cne $reservation.Marker
+        ) {
+            throw 'reservation identity changed before cleanup'
+        }
+        [IO.File]::Delete($reservation.Destination)
+        if (Test-PathEntryExists $reservation.Destination) {
+            throw 'destination still exists after reservation cleanup'
+        }
+    } catch {
+        $reservationCleanupErrors.Add(
+            "destination '$($reservation.RelativeDestination)': $($_.Exception.Message)"
+        )
     }
+}
+if ($reservationCleanupErrors.Count -gt 0) {
+    throw "initialization destination reservation cleanup failed; no template files were changed:`n  $($reservationCleanupErrors -join "`n  ")"
 }
 if ($collisions.Count -gt 0) {
     throw "initialization collision preflight failed; no files were changed:`n  $($collisions -join "`n  ")"
@@ -450,23 +492,21 @@ try {
 
     # 2) Execute the already validated one-to-one rename plan without overwrite.
     foreach ($entry in $renamePlan) {
-        # Journal intent before the move so an exception from Rename-Item itself
-        # is also covered. Rollback treats an extant source as a no-op.
-        $completedRenames.Add($entry)
         if (Test-PathEntryExists $entry.Destination) {
             throw "Destination '$($entry.RelativeDestination)' appeared after preflight; refusing to rename source '$($entry.RelativeSource)'."
         }
         Rename-Item -LiteralPath $entry.Source -NewName $entry.NewName -ErrorAction Stop
+        $completedRenames.Add($entry)
         Write-Host "    Renamed $($entry.OriginalName) -> $($entry.NewName)" -ForegroundColor DarkGray
     }
 
     # 3) Activate Claude Code shared settings without overwrite.
     if ($activateClaudeSettings) {
-        $settingsActivated = $true
         if (Test-PathEntryExists $claudeSettings) {
             throw "Destination '.claude/settings.json' appeared after preflight; refusing to activate source '.claude/settings.json.template'."
         }
         Move-Item -LiteralPath $claudeTemplate -Destination $claudeSettings -ErrorAction Stop
+        $settingsActivated = $true
         Write-Host "    Activated .claude/settings.json" -ForegroundColor DarkGray
     }
 } catch {

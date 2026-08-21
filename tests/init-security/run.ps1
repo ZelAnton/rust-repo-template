@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [switch]$CollisionOnly,
-    [switch]$RaceOnly
+    [switch]$RaceOnly,
+    [switch]$ReopenedOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -567,6 +568,29 @@ function Test-CaseInsensitiveFileSystem([string]$root) {
     }
 }
 
+function Test-FileSystemAliases(
+    [string]$root,
+    [string]$firstLeaf,
+    [string]$secondLeaf
+) {
+    $first = Join-Path $root $firstLeaf
+    $second = Join-Path $root $secondLeaf
+    try {
+        $stream = [IO.File]::Open(
+            $first,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        $stream.Dispose()
+        return Test-Path -LiteralPath $second
+    } finally {
+        if (Test-Path -LiteralPath $first) {
+            Remove-Item -LiteralPath $first -Force
+        }
+    }
+}
+
 function Test-CaseAliasDestinations(
     [ValidateSet('powershell', 'posix')][string]$kind
 ) {
@@ -612,6 +636,108 @@ function Test-CaseAliasDestinations(
             ([IO.File]::ReadAllText($path)) `
             $entry[1] `
             "$kind initializer changed case-distinct destination $($entry[0])"
+    }
+}
+
+function Test-UnicodeCaseAliasDestinations(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-unicode-case-alias"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $fixtureRoot = Join-Path $copyRoot '.initializer-unicode-alias'
+    [void](New-Item -ItemType Directory -Path $fixtureRoot)
+    Add-TextFixture $copyRoot '.initializer-unicode-alias/__ProjectName__Åa.txt' 'upper Unicode target'
+    Add-TextFixture $copyRoot '.initializer-unicode-alias/aå__ProjectName__.txt' 'lower Unicode target'
+    $aliases = Test-FileSystemAliases $fixtureRoot '.unicode-probe-aÅa.tmp' '.unicode-probe-aåa.tmp'
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        -kind $kind `
+        -copyRoot $copyRoot `
+        -author 'Unicode Tester' `
+        -authorEmail 'unicode@example.com' `
+        -ProjectName 'a'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($aliases) {
+        if ($result.ExitCode -eq 0) {
+            throw "$kind initializer accepted Unicode case-alias destinations"
+        }
+        Assert-DiagnosticContains $result `
+            'is planned by multiple sources' `
+            "$kind initializer did not report the Unicode case-alias destination collision."
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer mutated a Unicode case-alias fixture"
+        return
+    }
+
+    Assert-ProcessSucceeded $result "$kind Unicode case-distinct initialization"
+    foreach ($entry in @(
+        @('.initializer-unicode-alias/aÅa.txt', 'upper Unicode target'),
+        @('.initializer-unicode-alias/aåa.txt', 'lower Unicode target')
+    )) {
+        $path = Join-Path $copyRoot $entry[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$kind initializer falsely collapsed Unicode-distinct destination $($entry[0])"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($path)) `
+            $entry[1] `
+            "$kind initializer changed Unicode-distinct destination $($entry[0])"
+    }
+}
+
+function Test-PerDirectoryCaseSemantics(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    if (-not $IsWindows) {
+        return
+    }
+
+    $copyRoot = Join-Path $script:TempRoot "$kind-per-directory-case"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    if (-not (Test-CaseInsensitiveFileSystem $copyRoot)) {
+        Write-Host "Skipping $kind per-directory case fixture: temp root is already case-sensitive."
+        return
+    }
+
+    $fixtureRoot = Join-Path $copyRoot '.initializer-per-directory-case'
+    [void](New-Item -ItemType Directory -Path $fixtureRoot)
+    $enable = Invoke-CapturedProcess `
+        'fsutil.exe' `
+        @('file', 'setCaseSensitiveInfo', $fixtureRoot, 'enable') `
+        $copyRoot
+    if ($enable.ExitCode -ne 0 -or (Test-CaseInsensitiveFileSystem $fixtureRoot)) {
+        Write-Host "Skipping $kind per-directory case fixture: case-sensitive directory support is unavailable."
+        return
+    }
+
+    Add-TextFixture $copyRoot '.initializer-per-directory-case/__ProjectName__A.txt' 'upper target'
+    Add-TextFixture $copyRoot '.initializer-per-directory-case/a__ProjectName__.txt' 'lower target'
+    $invocation = Get-InitializerInvocation `
+        -kind $kind `
+        -copyRoot $copyRoot `
+        -author 'Per Directory Tester' `
+        -authorEmail 'per-directory@example.com' `
+        -ProjectName 'a'
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind per-directory case-sensitive initialization"
+
+    foreach ($entry in @(
+        @('.initializer-per-directory-case/aA.txt', 'upper target'),
+        @('.initializer-per-directory-case/aa.txt', 'lower target')
+    )) {
+        $path = Join-Path $copyRoot $entry[0]
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "$kind initializer ignored the destination directory's case semantics for $($entry[0])"
+        }
+        Assert-Equal `
+            ([IO.File]::ReadAllText($path)) `
+            $entry[1] `
+            "$kind initializer changed per-directory case fixture $($entry[0])"
     }
 }
 
@@ -664,6 +790,83 @@ function Test-LateRaceRollback(
         (Get-TreeFingerprint $copyRoot) `
         $before `
         "$kind initializer did not restore the original tree after a late race"
+}
+
+function Test-SourceDisappearedRaceRollback(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('rename', 'settings')][string]$operation
+) {
+    $copyRoot = Join-Path $script:TempRoot "$kind-source-disappeared-$operation"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    $quarantine = Join-Path $script:TempRoot "$kind-source-disappeared-$operation-quarantine"
+
+    if ($operation -eq 'rename') {
+        $relativeSource = '.initializer-source-race/__ProjectName__-source'
+        $relativeDestination = '.initializer-source-race/init-security-source'
+        Add-DirectoryFixture $copyRoot $relativeSource 'planned source must stay quarantined'
+        $source = Join-Path $copyRoot $relativeSource
+        $destination = Join-Path $copyRoot $relativeDestination
+        $externalMarker = Join-Path $destination 'marker.txt'
+        $expectedDiagnostic = "appeared after preflight; refusing to rename source '$relativeSource'"
+        $checkpointAction = {
+            Move-Item -LiteralPath $source -Destination $quarantine
+            Add-DirectoryFixture $copyRoot $relativeDestination 'independent destination must survive'
+        }
+    } else {
+        $source = Join-Path $copyRoot '.claude/settings.json.template'
+        $destination = Join-Path $copyRoot '.claude/settings.json'
+        $externalMarker = $destination
+        $expectedDiagnostic = "appeared after preflight; refusing to activate source '.claude/settings.json.template'"
+        $checkpointAction = {
+            Move-Item -LiteralPath $source -Destination $quarantine
+            Add-TextFixture $copyRoot '.claude/settings.json' 'independent settings must survive'
+        }
+    }
+
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot 'Source Race Tester' 'source-race@example.com'
+    $invocation.Environment['INIT_SECURITY_TEST_HOLD_AFTER_PREFLIGHT'] = '1'
+    $result = Invoke-CapturedProcessAtCheckpoint `
+        $invocation.FileName `
+        $invocation.Arguments `
+        $copyRoot `
+        $invocation.Environment `
+        'INITIALIZER_TEST_PREFLIGHT_READY' `
+        $checkpointAction
+
+    if (-not $result.CheckpointObserved) {
+        throw "$kind initializer did not expose the source-disappeared $operation checkpoint"
+    }
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted a disappeared $operation source and independent destination"
+    }
+    Assert-DiagnosticContains $result `
+        $expectedDiagnostic `
+        "$kind initializer returned an unclear source-disappeared $operation diagnostic."
+    if (-not (Test-Path -LiteralPath $destination)) {
+        throw "$kind initializer rollback removed or relocated the independent $operation destination"
+    }
+    if (-not (Test-Path -LiteralPath $quarantine)) {
+        throw "$kind initializer rollback consumed the quarantined $operation source"
+    }
+    $externalContent = [IO.File]::ReadAllText($externalMarker)
+    $expectedExternalContent = if ($operation -eq 'rename') {
+        'independent destination must survive'
+    } else {
+        'independent settings must survive'
+    }
+    Assert-Equal `
+        $externalContent `
+        $expectedExternalContent `
+        "$kind initializer rollback changed the independent $operation destination"
+
+    Remove-Item -LiteralPath $destination -Recurse -Force
+    Move-Item -LiteralPath $quarantine -Destination $source
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer did not restore the original tree after the source-disappeared $operation race fixture was reset"
 }
 
 function Test-RejectedLineBreak(
@@ -797,8 +1000,24 @@ try {
     if ($RaceOnly) {
         foreach ($kind in @('powershell', 'posix')) {
             Test-LateRaceRollback $kind
+            foreach ($operation in @('rename', 'settings')) {
+                Test-SourceDisappearedRaceRollback $kind $operation
+            }
         }
         Write-Host 'Initializer late-race rollback checks passed.' -ForegroundColor Green
+        return
+    }
+
+    if ($ReopenedOnly) {
+        foreach ($kind in @('powershell', 'posix')) {
+            Test-CaseAliasDestinations $kind
+            Test-UnicodeCaseAliasDestinations $kind
+            Test-PerDirectoryCaseSemantics $kind
+            foreach ($operation in @('rename', 'settings')) {
+                Test-SourceDisappearedRaceRollback $kind $operation
+            }
+        }
+        Write-Host 'Reopened initializer collision and rollback checks passed.' -ForegroundColor Green
         return
     }
 
@@ -808,7 +1027,12 @@ try {
     foreach ($kind in @('powershell', 'posix')) {
         Test-CollisionMatrix $kind
         Test-CaseAliasDestinations $kind
+        Test-UnicodeCaseAliasDestinations $kind
+        Test-PerDirectoryCaseSemantics $kind
         Test-LateRaceRollback $kind
+        foreach ($operation in @('rename', 'settings')) {
+            Test-SourceDisappearedRaceRollback $kind $operation
+        }
     }
     Write-Host 'Initializer traversal, collision, and rollback checks passed.' -ForegroundColor Green
     if ($CollisionOnly) {

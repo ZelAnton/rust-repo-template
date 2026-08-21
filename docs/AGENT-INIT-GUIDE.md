@@ -218,13 +218,16 @@ Newest first. Each entry: **Symptom → Root cause → Rule.**
   could also return a partial plan without propagating `find` failure.
 - **Rule:** Both initializers preflight every token-path rename and settings
   activation before the first template write, reject incomplete traversals,
-  compare destinations using the repo filesystem's actual case semantics, and
-  report all conflicting source→destination mappings together. Execute content,
-  path, and settings mutations as one rollback domain with non-overwriting moves:
-  a destination that appears after preflight must remain untouched, while the
-  initializer restores the original file bytes, names, and directories. The
-  template security harness verifies both the late-race rollback and that
-  case-distinct targets remain valid on case-sensitive filesystems.
+  and reserve each exact absent destination in its own parent so the filesystem
+  decides Unicode, case, normalization, and per-directory equivalence. Verify a
+  reservation's unique ownership marker before removing it, finish reservation
+  cleanup before template mutation, and report all conflicting
+  source→destination mappings together. Execute content, path, and settings
+  mutations as one rollback domain with non-overwriting moves, but journal only
+  operations proven completed by this initializer: a destination that appears
+  after preflight must remain untouched even if its planned source disappeared.
+  The harness verifies Unicode aliases, available per-directory behavior, and
+  source-disappeared races for both path and settings moves.
 
 ### 2026-08-20 — template-only initializer checks leaked downstream
 - **Symptom:** An initialized repo retained the initializer security CI step and
