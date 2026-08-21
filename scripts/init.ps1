@@ -266,12 +266,55 @@ $templateOnlyCiPattern = [regex]::new(
     '(?ms)^[ \t]*# template-only-init-security: begin\r?\n.*?^[ \t]*# template-only-init-security: end\r?\n?'
 )
 
+function ConvertTo-TomlBasicStringContent(
+    [string]$parameterName,
+    [AllowEmptyString()][string]$value
+) {
+    # Tokens in .toml templates are basic-string content, not complete TOML
+    # values. Use TOML's short escapes where available. Reject the remaining
+    # C0 controls and DEL before the transaction starts rather than emitting a
+    # manifest whose meaning depends on a parser's handling of literal controls.
+    $escaped = [Text.StringBuilder]::new($value.Length)
+    foreach ($character in $value.ToCharArray()) {
+        $codePoint = [int]$character
+        $replacement = switch ($codePoint) {
+            0x08 { '\b'; break }
+            0x09 { '\t'; break }
+            0x0a { '\n'; break }
+            0x0c { '\f'; break }
+            0x0d { '\r'; break }
+            0x22 { '\"'; break }
+            0x5c { '\\'; break }
+            default { $null }
+        }
+        if ($null -ne $replacement) {
+            [void]$escaped.Append($replacement)
+        } elseif ($codePoint -le 0x1f -or $codePoint -eq 0x7f) {
+            $display = 'U+{0:X4}' -f $codePoint
+            throw "Invalid -${parameterName}: control character $display is unsupported in TOML string input; no files were changed."
+        } else {
+            [void]$escaped.Append($character)
+        }
+    }
+    $escaped.ToString()
+}
+
 # Values written into TOML files (Cargo.toml description/repository) sit inside
-# double-quoted strings — a literal " or \ in an author/description would break
-# the manifest, so escape them for .toml targets.
+# double-quoted basic strings. Keep the serializer separate from ordinary text
+# substitution so Markdown, YAML, and paths still receive the original value.
+$tomlParameterNames = [ordered]@{
+    '__ProjectName__' = 'ProjectName'
+    '__Author__' = 'Author'
+    '__AuthorEmail__' = 'AuthorEmail'
+    '__GitHubOwner__' = 'GitHubOwner'
+    '__Description__' = 'Description'
+    '__Year__' = 'Year'
+}
 $tomlReplacements = [ordered]@{}
 foreach ($key in $replacements.Keys) {
-    $tomlReplacements[$key] = $replacements[$key].Replace('\', '\\').Replace('"', '\"')
+    $tomlReplacements[$key] = ConvertTo-TomlBasicStringContent `
+        -parameterName $tomlParameterNames[$key] `
+        -value $replacements[$key]
 }
 $tomlFileExtensions = @('.toml')
 

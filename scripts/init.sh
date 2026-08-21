@@ -135,16 +135,49 @@ base64_utf8() { printf '%s' "$1" | base64 | tr -d '\r\n'; }
 author_release="$(base64_utf8 "$author")"
 author_email_release="$(base64_utf8 "$author_email")"
 
-# Values written into TOML files (Cargo.toml description/repository) sit inside
-# double-quoted strings — escape backslash then quote so a literal " or \ can't
-# break the manifest.
-toml_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
-author_t="$(toml_escape "$author")"
-author_email_t="$(toml_escape "$author_email")"
-owner_t="$(toml_escape "$github_owner")"
-desc_t="$(toml_escape "$description")"
-crate_t="$(toml_escape "$crate_name")"
-year_t="$(toml_escape "$year")"
+# Tokens in .toml templates are basic-string content, not complete TOML values.
+# Use TOML's short escapes where available. Reject the remaining C0 controls and
+# DEL before creating the transaction directory rather than emitting a manifest
+# whose meaning depends on a parser's handling of literal controls.
+toml_escape() {
+  local parameter_name="$1"
+  local input="$2"
+  local character code_point display index
+  toml_escaped=""
+
+  # Byte-wise iteration leaves valid UTF-8 bytes untouched and makes every
+  # forbidden ASCII control observable independent of the caller's locale.
+  local LC_ALL=C
+  for ((index = 0; index < ${#input}; index++)); do
+    character="${input:index:1}"
+    case "$character" in
+      $'\b') toml_escaped+='\b' ;;
+      $'\t') toml_escaped+='\t' ;;
+      $'\n') toml_escaped+='\n' ;;
+      $'\f') toml_escaped+='\f' ;;
+      $'\r') toml_escaped+='\r' ;;
+      '"')   toml_escaped+='\"' ;;
+      '\')   toml_escaped+='\\' ;;
+      *)
+        printf -v code_point '%d' "'$character"
+        if ((code_point <= 31 || code_point == 127)); then
+          printf -v display 'U+%04X' "$code_point"
+          die "invalid $parameter_name: control character $display is unsupported in TOML string input; no files were changed."
+        fi
+        toml_escaped+="$character"
+        ;;
+    esac
+  done
+}
+
+# Keep TOML serialization separate from ordinary text substitution so
+# Markdown, YAML, and paths still receive the original value.
+toml_escape --author "$author"; author_t="$toml_escaped"
+toml_escape --author-email "$author_email"; author_email_t="$toml_escaped"
+toml_escape --github-owner "$github_owner"; owner_t="$toml_escaped"
+toml_escape --description "$description"; desc_t="$toml_escaped"
+toml_escape --project-name "$crate_name"; crate_t="$toml_escaped"
+toml_escape --year "$year"; year_t="$toml_escaped"
 
 echo "==> Initializing template as '$crate_name'"
 
