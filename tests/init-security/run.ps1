@@ -711,6 +711,57 @@ function Test-OpaquePathTokenReplacement(
     }
 }
 
+function Get-PathTokenSafetyCases {
+    @(
+        [pscustomobject]@{ Name = 'leading-and-internal-space'; Value = 'Path Author'; ExpectedSuccess = $true }
+        [pscustomobject]@{ Name = 'reserved-prefix-text'; Value = 'CONtext'; ExpectedSuccess = $true }
+        [pscustomobject]@{ Name = 'reserved-con-extension'; Value = 'CON.foo'; ExpectedSuccess = $false }
+        [pscustomobject]@{ Name = 'reserved-com-extension'; Value = 'COM1.foo'; ExpectedSuccess = $false }
+        [pscustomobject]@{ Name = 'multi-digit-com'; Value = 'COM10'; ExpectedSuccess = $true }
+    )
+}
+
+function Test-PathTokenSafetyCase(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [pscustomobject]$case
+) {
+    $values = Get-PathTokenReplacementValues
+    $values.Description = $case.Value
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-safety-$($case.Name)"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-path-tokens/__Description__.txt' 'path-token safety fixture'
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+
+    if ($case.ExpectedSuccess) {
+        Assert-ProcessSucceeded $result "$kind path-token safety case $($case.Name)"
+        $expected = Join-Path $copyRoot ".initializer-path-tokens/$($case.Value).txt"
+        if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) {
+            throw "$kind initializer did not accept portable path-token value '$($case.Value)'"
+        }
+    } else {
+        if ($result.ExitCode -eq 0) {
+            throw "$kind initializer accepted reserved path-token value '$($case.Value)'"
+        }
+        Assert-DiagnosticContains $result 'unsupported or unsafe path token' `
+            "$kind initializer returned an unclear rejection for path-token value '$($case.Value)'"
+        Assert-DiagnosticContains $result 'no files were changed' `
+            "$kind initializer omitted the no-mutation guarantee for path-token value '$($case.Value)'"
+        Assert-Equal `
+            (Get-TreeFingerprint $copyRoot) `
+            $before `
+            "$kind initializer mutated the tree before rejecting path-token value '$($case.Value)'"
+    }
+
+    Get-TreeFingerprint $copyRoot
+}
+
 function Test-RejectedPathToken(
     [ValidateSet('powershell', 'posix')][string]$kind,
     [ValidateSet('unsafe-value', 'unknown-token')][string]$caseName
@@ -749,11 +800,16 @@ function Test-RejectedPathToken(
 
 function Invoke-PathTokenSuite {
     $fingerprints = [ordered]@{}
+    $safetyFingerprints = [ordered]@{}
+    $safetyCases = @(Get-PathTokenSafetyCases)
     foreach ($kind in @('powershell', 'posix')) {
         Test-PathTokenRenames $kind
         Test-OpaquePathTokenReplacement $kind
         Test-RejectedPathToken $kind 'unsafe-value'
         Test-RejectedPathToken $kind 'unknown-token'
+        foreach ($case in $safetyCases) {
+            $safetyFingerprints["$kind|$($case.Name)"] = Test-PathTokenSafetyCase $kind $case
+        }
         $fingerprints[$kind] = Get-TreeFingerprint `
             (Join-Path $script:TempRoot "$kind-path-token-renames")
     }
@@ -761,6 +817,12 @@ function Invoke-PathTokenSuite {
         $fingerprints.posix `
         $fingerprints.powershell `
         'PowerShell and POSIX initializers produced different path-token trees'
+    foreach ($case in $safetyCases) {
+        Assert-Equal `
+            $safetyFingerprints["posix|$($case.Name)"] `
+            $safetyFingerprints["powershell|$($case.Name)"] `
+            "PowerShell and POSIX initializers diverged for path-token safety case '$($case.Value)'"
+    }
     Write-Host 'Initializer path-token contract checks passed.' -ForegroundColor Green
 }
 
