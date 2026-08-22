@@ -41,7 +41,7 @@ jobs:
 
       # Exercise the same standard-library parser used by the release workflow.
       - name: Test release-note extraction
-        run: python tests/release-notes/test_extract_release_notes.py
+        run: python -B tests/release-notes/test_extract_release_notes.py
 
       - name: Test CI tool version pins
         run: python tests/ci-tooling/test_ci_tool_pins.py
