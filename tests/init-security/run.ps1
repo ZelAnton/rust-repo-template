@@ -10,7 +10,12 @@ param(
     [switch]$DuplicateGitPathOnly,
     [switch]$ReleaseIdentityOnly,
     [switch]$TomlOnly,
-    [switch]$SinglePassOnly
+    [switch]$SinglePassOnly,
+    [switch]$PathTokenOnly,
+    [switch]$HarnessPlanOnly,
+    [string]$InternalSuite = '',
+    [int]$InternalShardIndex = -1,
+    [int]$InternalShardCount = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,6 +119,52 @@ function Invoke-CapturedProcess(
         ExitCode = $process.ExitCode
         Stdout = $stdout.GetAwaiter().GetResult()
         Stderr = $stderr.GetAwaiter().GetResult()
+    }
+}
+
+function Start-CapturedProcess(
+    [string]$fileName,
+    [string[]]$arguments,
+    [string]$workingDirectory,
+    [Collections.IDictionary]$environment = @{}
+) {
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $fileName
+    $startInfo.WorkingDirectory = $workingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($entry in $environment.GetEnumerator()) {
+        $startInfo.Environment[[string]$entry.Key] = [string]$entry.Value
+    }
+    foreach ($argument in $arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "Failed to start $fileName"
+    }
+
+    [pscustomobject]@{
+        Process = $process
+        Stdout = $process.StandardOutput.ReadToEndAsync()
+        Stderr = $process.StandardError.ReadToEndAsync()
+    }
+}
+
+function Complete-CapturedProcess($runningProcess) {
+    $process = $runningProcess.Process
+    $process.WaitForExit()
+    try {
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Stdout = $runningProcess.Stdout.GetAwaiter().GetResult()
+            Stderr = $runningProcess.Stderr.GetAwaiter().GetResult()
+        }
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -586,6 +637,131 @@ function Invoke-SinglePassLiteralSubstitutionSuite {
         Test-SinglePassLiteralSubstitution $kind
     }
     Write-Host 'Initializer single-pass literal substitution checks passed.' -ForegroundColor Green
+}
+
+function Get-PathTokenReplacementValues {
+    [ordered]@{
+        ProjectName = 'path-token-security'
+        Author = 'Path Author'
+        AuthorEmail = 'path@example.com'
+        GitHubOwner = 'path-owner'
+        Description = 'path-description'
+        Year = '2026'
+    }
+}
+
+function Add-PathTokenFixtures([string]$copyRoot) {
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-path-tokens/__Author__-__AuthorEmail__/__GitHubOwner____Description____Year____ProjectName____ProjectName__.txt' `
+        'path-token fixture'
+}
+
+function Test-PathTokenRenames(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $values = Get-PathTokenReplacementValues
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-renames"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-PathTokenFixtures $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind path-token renames"
+
+    $expected = Join-Path `
+        $copyRoot `
+        '.initializer-path-tokens/Path Author-path@example.com/path-ownerpath-description2026path-token-securitypath-token-security.txt'
+    if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) {
+        throw "$kind initializer did not replace every supported token in nested, repeated, and adjacent path names"
+    }
+    foreach ($stalePath in @(
+        '.initializer-path-tokens/__Author__-__AuthorEmail__',
+        '.initializer-path-tokens/Path Author-path@example.com/__GitHubOwner____Description____Year____ProjectName____ProjectName__.txt'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $copyRoot $stalePath)) {
+            throw "$kind initializer retained stale token path $stalePath"
+        }
+    }
+}
+
+function Test-OpaquePathTokenReplacement(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $values = Get-PathTokenReplacementValues
+    $values.Description = 'opaque-__Author__-value'
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-opaque"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-path-tokens/opaque-__Description__.txt' 'opaque path fixture'
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind opaque path-token replacement"
+    $expected = Join-Path $copyRoot '.initializer-path-tokens/opaque-opaque-__Author__-value.txt'
+    if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) {
+        throw "$kind initializer rescanned an opaque path replacement value"
+    }
+}
+
+function Test-RejectedPathToken(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('unsafe-value', 'unknown-token')][string]$caseName
+) {
+    $values = Get-PathTokenReplacementValues
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-reject-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    if ($caseName -eq 'unsafe-value') {
+        Add-TextFixture $copyRoot '.initializer-path-tokens/__Description__.txt' 'unsafe path fixture'
+        $values.Description = 'unsafe/path'
+        $expectedDiagnostic = 'unsupported or unsafe path token'
+    } else {
+        Add-TextFixture $copyRoot '.initializer-path-tokens/__Unsupported_Token__.txt' 'unknown path fixture'
+        $expectedDiagnostic = 'unsupported path token'
+    }
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted $caseName path-token input"
+    }
+    Assert-DiagnosticContains $result $expectedDiagnostic `
+        "$kind initializer returned an unclear $caseName path-token diagnostic"
+    Assert-DiagnosticContains $result 'no files were changed' `
+        "$kind initializer omitted the no-mutation guarantee for $caseName path-token rejection"
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer mutated the tree before rejecting $caseName path-token input"
+}
+
+function Invoke-PathTokenSuite {
+    $fingerprints = [ordered]@{}
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-PathTokenRenames $kind
+        Test-OpaquePathTokenReplacement $kind
+        Test-RejectedPathToken $kind 'unsafe-value'
+        Test-RejectedPathToken $kind 'unknown-token'
+        $fingerprints[$kind] = Get-TreeFingerprint `
+            (Join-Path $script:TempRoot "$kind-path-token-renames")
+    }
+    Assert-Equal `
+        $fingerprints.posix `
+        $fingerprints.powershell `
+        'PowerShell and POSIX initializers produced different path-token trees'
+    Write-Host 'Initializer path-token contract checks passed.' -ForegroundColor Green
 }
 
 function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]$description) {
@@ -1925,9 +2101,371 @@ function Test-RejectedGitConfigLineBreak(
     Assert-Equal (Get-TreeFingerprint $copyRoot) $before "$kind initializer mutated files before rejecting $caseName in default git-config $field"
 }
 
+function Invoke-ContentSafetyCoverage {
+    $psContent = Test-SafeContentSuccess powershell
+    $shContent = Test-SafeContentSuccess posix
+    Assert-Equal $shContent $psContent 'Initializers produced different safe-content bytes'
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-GitFileExclusion $kind
+        Test-LinkPreflightFailure $kind
+        Test-RequiredBinaryPreflightFailure $kind
+        Test-PostPreflightHardLinkRollback $kind
+    }
+}
+
+function Invoke-CollisionCoverage(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('matrix', 'reservation', 'race')][string]$part
+) {
+    switch ($part) {
+        'matrix' {
+            if ($kind -eq 'posix') {
+                foreach ($phase in @('content', 'rename')) {
+                    Test-CheckedPosixTraversal $phase
+                }
+            }
+            Test-CollisionMatrix $kind
+            Test-CaseAliasDestinations $kind
+            Test-UnicodeCaseAliasDestinations $kind
+            Test-PerDirectoryCaseSemantics $kind
+        }
+        'reservation' {
+            Test-PartialReservationMarkerFailure $kind
+            foreach ($replacementKind in @('file', 'directory', 'link')) {
+                Test-PartialReservationMarkerFailure $kind $replacementKind
+            }
+            foreach ($replacementKind in @('file', 'directory', 'link')) {
+                Test-ReservationReplacementAfterOwnershipCheck $kind $replacementKind
+            }
+        }
+        'race' {
+            Test-LateRaceRollback $kind
+            foreach ($operation in @('rename', 'settings')) {
+                Test-SourceDisappearedRaceRollback $kind $operation
+            }
+        }
+    }
+}
+
+function Invoke-ReleaseIdentityDiscoveryCoverage {
+    Test-DiagnosticNormalization
+    Test-PowerShellDuplicateGitPathDiscovery
+    foreach ($source in @('defaults', 'explicit')) {
+        Test-PowerShellInitializationWithoutGit $source
+    }
+}
+
+function Invoke-ReleaseIdentitySuccessCoverage {
+    $ordinaryAuthor = 'Renée  O''Connor, "R&D" + QA'
+    $ordinaryEmail = 'anne.o+release@example.com'
+    $hostileAuthor = 'Eve "$(touch$IFS./init-security-name-owned)" #:[]{}&*!| suffix'
+    $hostileEmail = 'attacker+$(touch$IFS./init-security-email-owned)@example.com'
+
+    $psPlain = Test-SuccessfulInitialization powershell explicit plain-template `
+        $ordinaryAuthor $ordinaryEmail -AddRenameFixtures:$false
+    $shPlain = Test-SuccessfulInitialization posix explicit plain-template `
+        $ordinaryAuthor $ordinaryEmail -AddRenameFixtures:$false
+    Assert-Equal $shPlain $psPlain 'Initializers generated different plain-template release workflows'
+
+    $psOrdinary = Test-SuccessfulInitialization powershell explicit ordinary $ordinaryAuthor $ordinaryEmail
+    $shOrdinary = Test-SuccessfulInitialization posix explicit ordinary $ordinaryAuthor $ordinaryEmail
+    Assert-Equal $shOrdinary $psOrdinary 'Initializers generated different ordinary release workflows'
+
+    $psStandard = Test-SuccessfulInitialization powershell explicit standard-no-keep $ordinaryAuthor $ordinaryEmail -KeepScript:$false
+    $shStandard = Test-SuccessfulInitialization posix explicit standard-no-keep $ordinaryAuthor $ordinaryEmail -KeepScript:$false
+    Assert-Equal $shStandard $psStandard 'Standard initializers generated different release workflows'
+
+    $psHostile = Test-SuccessfulInitialization powershell explicit hostile $hostileAuthor $hostileEmail
+    $shHostile = Test-SuccessfulInitialization posix explicit hostile $hostileAuthor $hostileEmail
+    Assert-Equal $shHostile $psHostile 'Initializers generated different hostile release workflows'
+
+    $roundTripAuthor = '.Edge "double" ''single'', colon: semicolon; backslash\ exact.'
+    $roundTripEmail = '.edge"double"''single'',colon:semicolon;backslash\exact.@example.com.'
+    $roundTripWorkflow = $null
+    foreach ($source in @('explicit', 'git-config')) {
+        $psRoundTrip = Test-SuccessfulInitialization powershell $source allowed-punctuation $roundTripAuthor $roundTripEmail
+        $shRoundTrip = Test-SuccessfulInitialization posix $source allowed-punctuation $roundTripAuthor $roundTripEmail
+        Assert-Equal $shRoundTrip $psRoundTrip "Initializers generated different allowed-punctuation workflows for $source input"
+        if ($null -eq $roundTripWorkflow) {
+            $roundTripWorkflow = $psRoundTrip
+        } else {
+            Assert-Equal $psRoundTrip $roundTripWorkflow 'Explicit and git-config inputs generated different allowed-punctuation workflows'
+        }
+    }
+}
+
+function Get-ReleaseIdentityRejectionCases {
+    $cases = [Collections.Generic.List[object]]::new()
+    foreach ($kind in @('powershell', 'posix')) {
+        foreach ($field in @('author', 'email')) {
+            $cases.Add([pscustomobject]@{
+                Type = 'line-break'; Kind = $kind; Field = $field
+            })
+            foreach ($case in @(
+                @{ Name = 'internal-lf'; Value = "Line`nBreak" },
+                @{ Name = 'internal-cr'; Value = "Line`rBreak" },
+                @{ Name = 'trailing-lf'; Value = "LineBreak`n" },
+                @{ Name = 'trailing-cr'; Value = "LineBreak`r" }
+            )) {
+                $cases.Add([pscustomobject]@{
+                    Type = 'git-config-line-break'; Kind = $kind; Field = $field
+                    CaseName = $case.Name; Value = $case.Value
+                })
+            }
+            foreach ($source in @('explicit', 'git-config')) {
+                foreach ($case in @(
+                    @{ Name = 'internal-open-angle'; Value = 'Angle<Edge' },
+                    @{ Name = 'internal-close-angle'; Value = 'Angle>Edge' },
+                    @{ Name = 'leading-space'; Value = ' Edge' },
+                    @{ Name = 'trailing-space'; Value = 'Edge ' },
+                    @{ Name = 'leading-tab'; Value = "`tEdge" },
+                    @{ Name = 'trailing-tab'; Value = "Edge`t" },
+                    @{ Name = 'leading-vertical-tab'; Value = "`vEdge" },
+                    @{ Name = 'trailing-vertical-tab'; Value = "Edge`v" },
+                    @{ Name = 'leading-form-feed'; Value = "`fEdge" },
+                    @{ Name = 'trailing-form-feed'; Value = "Edge`f" },
+                    @{ Name = 'leading-double-quote'; Value = '"Edge' },
+                    @{ Name = 'trailing-double-quote'; Value = 'Edge"' },
+                    @{ Name = 'leading-single-quote'; Value = "'Edge" },
+                    @{ Name = 'trailing-single-quote'; Value = "Edge'" },
+                    @{ Name = 'leading-comma'; Value = ',Edge' },
+                    @{ Name = 'trailing-comma'; Value = 'Edge,' },
+                    @{ Name = 'leading-colon'; Value = ':Edge' },
+                    @{ Name = 'trailing-colon'; Value = 'Edge:' },
+                    @{ Name = 'leading-semicolon'; Value = ';Edge' },
+                    @{ Name = 'trailing-semicolon'; Value = 'Edge;' },
+                    @{ Name = 'leading-backslash'; Value = '\Edge' },
+                    @{ Name = 'trailing-backslash'; Value = 'Edge\' }
+                )) {
+                    $cases.Add([pscustomobject]@{
+                        Type = 'git-ident'; Kind = $kind; Field = $field; Source = $source
+                        CaseName = $case.Name; Value = $case.Value
+                    })
+                }
+            }
+        }
+    }
+    $cases.ToArray()
+}
+
+function Invoke-ReleaseIdentityRejectionCoverage(
+    [int]$shardIndex,
+    [int]$shardCount
+) {
+    if ($shardCount -lt 1 -or $shardIndex -lt 0 -or $shardIndex -ge $shardCount) {
+        throw "Invalid identity rejection shard $shardIndex/$shardCount"
+    }
+    $cases = @(Get-ReleaseIdentityRejectionCases)
+    for ($index = 0; $index -lt $cases.Count; $index++) {
+        if (($index % $shardCount) -ne $shardIndex) {
+            continue
+        }
+        $case = $cases[$index]
+        switch ($case.Type) {
+            'line-break' {
+                Test-RejectedLineBreak $case.Kind $case.Field
+            }
+            'git-config-line-break' {
+                Test-RejectedGitConfigLineBreak `
+                    $case.Kind $case.Field $case.CaseName $case.Value
+            }
+            'git-ident' {
+                Test-RejectedGitIdentValue `
+                    $case.Kind $case.Field $case.Source $case.CaseName $case.Value
+            }
+            default {
+                throw "Unknown release identity rejection case type: $($case.Type)"
+            }
+        }
+    }
+}
+
+function New-HarnessJob([string]$name, [string[]]$arguments) {
+    [pscustomobject]@{ Name = $name; Arguments = $arguments }
+}
+
+function New-ReleaseIdentityHarnessJobs {
+    $jobs = [Collections.Generic.List[object]]::new()
+    $jobs.Add((New-HarnessJob 'release-discovery' @('-InternalSuite', 'release-discovery')))
+    $jobs.Add((New-HarnessJob 'release-success' @('-InternalSuite', 'release-success')))
+    $shardCount = 8
+    for ($index = 0; $index -lt $shardCount; $index++) {
+        $jobs.Add((New-HarnessJob "release-rejections-$index" @(
+            '-InternalSuite', 'release-rejections',
+            '-InternalShardIndex', [string]$index,
+            '-InternalShardCount', [string]$shardCount
+        )))
+    }
+    $jobs.ToArray()
+}
+
+function New-DefaultHarnessJobs {
+    # Longest-first scheduling prevents the final wall time from being set by
+    # a heavy suite that only starts after the short workers have drained.
+    $releaseJobs = @(New-ReleaseIdentityHarnessJobs)
+    $jobs = [Collections.Generic.List[object]]::new()
+    $jobs.Add(($releaseJobs | Where-Object Name -eq 'release-success'))
+    $jobs.Add((New-HarnessJob 'collision-posix-matrix' @('-InternalSuite', 'collision-posix-matrix')))
+    $jobs.Add((New-HarnessJob 'collision-posix-reservation' @('-InternalSuite', 'collision-posix-reservation')))
+    $jobs.Add((New-HarnessJob 'content-safety' @('-InternalSuite', 'content-safety')))
+    $jobs.Add((New-HarnessJob 'collision-posix-race' @('-InternalSuite', 'collision-posix-race')))
+    $jobs.Add((New-HarnessJob 'toml' @('-InternalSuite', 'toml')))
+    $jobs.Add((New-HarnessJob 'collision-powershell-matrix' @('-InternalSuite', 'collision-powershell-matrix')))
+    $jobs.Add((New-HarnessJob 'collision-powershell-reservation' @('-InternalSuite', 'collision-powershell-reservation')))
+    $jobs.Add((New-HarnessJob 'collision-powershell-race' @('-InternalSuite', 'collision-powershell-race')))
+    $jobs.Add((New-HarnessJob 'single-pass' @('-InternalSuite', 'single-pass')))
+    $jobs.Add(($releaseJobs | Where-Object Name -eq 'release-discovery'))
+    foreach ($job in @($releaseJobs | Where-Object Name -like 'release-rejections-*')) {
+        $jobs.Add($job)
+    }
+    $jobs.ToArray()
+}
+
+function Test-HarnessPlanContract {
+    $defaultJobs = @(New-DefaultHarnessJobs)
+    $releaseJobs = @(New-ReleaseIdentityHarnessJobs)
+    $expectedDefaultNames = @(
+        'release-success',
+        'collision-posix-matrix',
+        'collision-posix-reservation',
+        'content-safety',
+        'collision-posix-race',
+        'toml',
+        'collision-powershell-matrix',
+        'collision-powershell-reservation',
+        'collision-powershell-race',
+        'single-pass',
+        'release-discovery',
+        'release-rejections-0',
+        'release-rejections-1',
+        'release-rejections-2',
+        'release-rejections-3',
+        'release-rejections-4',
+        'release-rejections-5',
+        'release-rejections-6',
+        'release-rejections-7'
+    )
+    Assert-Equal $defaultJobs.Count 19 'Default harness plan must contain every isolated suite exactly once'
+    Assert-Equal $releaseJobs.Count 10 'Release-identity harness plan has an unexpected worker count'
+    Assert-Equal `
+        ($defaultJobs.Name -join '|') `
+        ($expectedDefaultNames -join '|') `
+        'Default harness plan order or membership changed unexpectedly'
+    Assert-Equal `
+        @($defaultJobs.Name | Sort-Object -Unique).Count `
+        $defaultJobs.Count `
+        'Default harness plan contains duplicate worker names'
+    Assert-Equal `
+        @($releaseJobs | Where-Object Name -like 'release-rejections-*').Count `
+        8 `
+        'Release-identity rejection matrix must retain all eight shards'
+    Assert-Equal `
+        @(Get-ReleaseIdentityRejectionCases).Count `
+        196 `
+        'Release-identity rejection matrix changed coverage unexpectedly'
+}
+
+function Get-HarnessParallelism {
+    $parallelism = [Math]::Min(4, [Math]::Max(1, [Environment]::ProcessorCount))
+    $configured = 0
+    if (
+        $env:INIT_SECURITY_MAX_PARALLEL -and
+        [int]::TryParse($env:INIT_SECURITY_MAX_PARALLEL, [ref]$configured) -and
+        $configured -ge 1 -and
+        $configured -le 16
+    ) {
+        return $configured
+    }
+    $parallelism
+}
+
+function Invoke-HarnessWorkers([object[]]$jobs) {
+    $pending = [Collections.Generic.Queue[object]]::new()
+    foreach ($job in $jobs) {
+        $pending.Enqueue($job)
+    }
+    $running = [Collections.Generic.List[object]]::new()
+    $parallelism = Get-HarnessParallelism
+    Write-Host "Running $($jobs.Count) isolated initializer suites with max parallelism $parallelism."
+
+    try {
+        while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+            while ($pending.Count -gt 0 -and $running.Count -lt $parallelism) {
+                $job = $pending.Dequeue()
+                $capture = Start-CapturedProcess `
+                    $script:PwshPath `
+                    (@('-NoProfile', '-File', $script:ScriptPath) + $job.Arguments) `
+                    $script:RepoRoot
+                $running.Add([pscustomobject]@{
+                    Job = $job
+                    Capture = $capture
+                    StartedAt = [DateTime]::UtcNow
+                })
+            }
+
+            $completed = @($running | Where-Object { $_.Capture.Process.HasExited })
+            if ($completed.Count -eq 0) {
+                Start-Sleep -Milliseconds 50
+                continue
+            }
+
+            foreach ($entry in $completed) {
+                $result = Complete-CapturedProcess $entry.Capture
+                [void]$running.Remove($entry)
+                $duration = ([DateTime]::UtcNow - $entry.StartedAt).TotalSeconds
+                if ($result.ExitCode -ne 0) {
+                    throw "Initializer harness worker '$($entry.Job.Name)' failed with exit code $($result.ExitCode).`nstdout:`n$($result.Stdout)`nstderr:`n$($result.Stderr)"
+                }
+                Write-Host ("[{0}] passed in {1:n1}s" -f $entry.Job.Name, $duration)
+            }
+        }
+    } catch {
+        foreach ($entry in @($running)) {
+            try {
+                if (-not $entry.Capture.Process.HasExited) {
+                    $entry.Capture.Process.Kill($true)
+                }
+                [void](Complete-CapturedProcess $entry.Capture)
+            } catch {
+                # Preserve the first semantic worker failure.
+            }
+        }
+        throw
+    }
+}
+
+function Invoke-InternalHarnessSuite([string]$suite, [int]$shardIndex, [int]$shardCount) {
+    switch ($suite) {
+        'content-safety' { Invoke-ContentSafetyCoverage }
+        'collision-powershell-matrix' { Invoke-CollisionCoverage powershell matrix }
+        'collision-powershell-reservation' { Invoke-CollisionCoverage powershell reservation }
+        'collision-powershell-race' { Invoke-CollisionCoverage powershell race }
+        'collision-posix-matrix' { Invoke-CollisionCoverage posix matrix }
+        'collision-posix-reservation' { Invoke-CollisionCoverage posix reservation }
+        'collision-posix-race' { Invoke-CollisionCoverage posix race }
+        'toml' {
+            Test-TomlSuiteRoutingContract
+            Test-DiagnosticNormalization
+            Invoke-TomlBasicStringSuite
+        }
+        'single-pass' {
+            Test-SinglePassSuiteRoutingContract
+            Invoke-SinglePassLiteralSubstitutionSuite
+            Invoke-PathTokenSuite
+        }
+        'release-discovery' { Invoke-ReleaseIdentityDiscoveryCoverage }
+        'release-success' { Invoke-ReleaseIdentitySuccessCoverage }
+        'release-rejections' {
+            Invoke-ReleaseIdentityRejectionCoverage $shardIndex $shardCount
+        }
+        default { throw "Unknown internal initializer security suite: $suite" }
+    }
+}
+
 $RepoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $VerifierPath = Join-Path $PSScriptRoot 'verify-generated-workflow.py'
 $PwshPath = (Get-Command pwsh -ErrorAction Stop).Source
+$ScriptPath = [IO.Path]::GetFullPath($PSCommandPath)
 
 if ($IsWindows) {
     $gitBash = Join-Path $env:ProgramFiles 'Git\bin\bash.exe'
@@ -1950,15 +2488,54 @@ $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("rust-template-init-security-"
 [void](New-Item -ItemType Directory -Path $TempRoot)
 
 try {
+    Test-HarnessPlanContract
+
+    if ($HarnessPlanOnly) {
+        Write-Host 'Initializer parallel harness plan checks passed.' -ForegroundColor Green
+        return
+    }
+
+    if ($InternalSuite) {
+        if (
+            $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
+            $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
+            $TomlOnly -or $SinglePassOnly -or $PathTokenOnly -or $HarnessPlanOnly
+        ) {
+            throw '-InternalSuite cannot be combined with a public focused selector'
+        }
+        Invoke-InternalHarnessSuite $InternalSuite $InternalShardIndex $InternalShardCount
+        return
+    }
+
+    $hasPublicSelector = [bool](
+        $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
+        $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
+        $TomlOnly -or $SinglePassOnly -or $PathTokenOnly
+    )
+    if (-not $hasPublicSelector) {
+        Invoke-HarnessWorkers @(New-DefaultHarnessJobs)
+        Write-Host 'Initializer traversal, collision, and rollback checks passed.' -ForegroundColor Green
+        Write-Host 'Initializer TOML basic-string parity checks passed.' -ForegroundColor Green
+        Write-Host 'Initializer single-pass literal substitution checks passed.' -ForegroundColor Green
+        Write-Host 'Initializer release-identity security checks passed.' -ForegroundColor Green
+        return
+    }
+
+    if ($ReleaseIdentityOnly) {
+        Invoke-HarnessWorkers @(New-ReleaseIdentityHarnessJobs)
+        Write-Host 'Initializer release-identity security checks passed.' -ForegroundColor Green
+        return
+    }
+
     $hasNonTomlSelector = [bool](
         $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
         $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
-        $SinglePassOnly
+        $SinglePassOnly -or $PathTokenOnly
     )
     $hasNonSinglePassSelector = [bool](
         $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
         $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
-        $TomlOnly
+        $TomlOnly -or $PathTokenOnly
     )
     $runTomlSuite = Test-ShouldRunTomlSuite `
         -tomlOnly:$TomlOnly `
@@ -1983,6 +2560,11 @@ try {
             throw 'Internal routing error: -SinglePassOnly did not select the single-pass regression suite'
         }
         Invoke-SinglePassLiteralSubstitutionSuite
+        return
+    }
+
+    if ($PathTokenOnly) {
+        Invoke-PathTokenSuite
         return
     }
 
@@ -2089,6 +2671,8 @@ try {
     if ($runSinglePassSuite) {
         Invoke-SinglePassLiteralSubstitutionSuite
     }
+
+    Invoke-PathTokenSuite
 
     Test-PowerShellDuplicateGitPathDiscovery
 
