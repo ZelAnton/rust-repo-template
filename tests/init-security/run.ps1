@@ -12,6 +12,7 @@ param(
     [switch]$TomlOnly,
     [switch]$SinglePassOnly,
     [switch]$PathTokenOnly,
+    [switch]$ParserOnly,
     [switch]$HarnessPlanOnly,
     [string]$InternalSuite = '',
     [int]$InternalShardIndex = -1,
@@ -284,6 +285,123 @@ function Add-DirectoryFixture([string]$root, [string]$relativePath, [string]$mar
     }
     [void](New-Item -ItemType Directory -Path $path)
     Add-TextFixture $path 'marker.txt' $marker
+}
+
+function Test-PosixParserRejectedValue(
+    [string]$caseName,
+    [string[]]$arguments,
+    [string]$expectedOption
+) {
+    $root = Join-Path $script:TempRoot "parser-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $root
+    $before = Get-TreeFingerprint $root
+    $result = Invoke-CapturedProcess `
+        $script:BashPath `
+        (@('./scripts/init.sh') + $arguments) `
+        $root
+    if ($result.ExitCode -eq 0) {
+        throw "POSIX parser accepted rejected invocation '$caseName'."
+    }
+
+    $diagnostic = "$($result.Stdout)`n$($result.Stderr)"
+    $optionName = $expectedOption.TrimStart('-')
+    if ($diagnostic -notmatch [regex]::Escape($optionName)) {
+        throw "POSIX parser did not name $expectedOption in '$caseName' diagnostic: $diagnostic"
+    }
+    if ($diagnostic -match 'Preflight validated|rollback') {
+        throw "POSIX parser entered mutation/rollback for rejected invocation '$caseName'."
+    }
+    Assert-Equal (Get-TreeFingerprint $root) $before `
+        "POSIX parser changed the template after rejecting '$caseName'"
+}
+
+function Test-PosixParserContract {
+    $optionCases = @(
+        @{ Case = 'project-name'; Option = '--project-name' },
+        @{ Case = 'author'; Option = '--author' },
+        @{ Case = 'author-email'; Option = '--author-email' },
+        @{ Case = 'github-owner'; Option = '--github-owner' },
+        @{ Case = 'description'; Option = '--description' },
+        @{ Case = 'year'; Option = '--year' }
+    )
+    $followingOptions = @('-h', '-x', '--unknown-option')
+
+    foreach ($optionCase in $optionCases) {
+        $prefix = if ($optionCase.Case -eq 'project-name') {
+            @()
+        } else {
+            @('--project-name', 'Parser.Contract')
+        }
+        Test-PosixParserRejectedValue `
+            "$($optionCase.Case)-end" `
+            ($prefix + $optionCase.Option) `
+            $optionCase.Option
+        foreach ($followingOption in $followingOptions) {
+            Test-PosixParserRejectedValue `
+                "$($optionCase.Case)-$($followingOption.TrimStart('-').Replace('-', '_'))" `
+                ($prefix + $optionCase.Option + $followingOption) `
+                $optionCase.Option
+        }
+    }
+
+    foreach ($invalidYear in @('not-a-year', '2147483648', '-2147483649', '+')) {
+        Test-PosixParserRejectedValue `
+            "year-invalid-$($invalidYear.Replace('-', 'minus').Replace('+', 'plus'))" `
+            @('--project-name', 'Parser.Contract', '--year', $invalidYear, '--keep-script') `
+            '--year'
+    }
+
+    $unknownRoot = Join-Path $script:TempRoot 'parser-unknown-option'
+    Copy-Template -source $script:RepoRoot -destination $unknownRoot
+    $unknownBefore = Get-TreeFingerprint $unknownRoot
+    $unknown = Invoke-CapturedProcess `
+        $script:BashPath `
+        @('./scripts/init.sh', '--project-name', 'Parser.Contract', '--unknown-option') `
+        $unknownRoot
+    if ($unknown.ExitCode -eq 0 -or $unknown.Stderr -notmatch 'unknown argument') {
+        throw "POSIX parser did not reject an unknown option: $($unknown.Stderr)"
+    }
+    Assert-Equal (Get-TreeFingerprint $unknownRoot) $unknownBefore `
+        'POSIX parser changed the template after rejecting an unknown option'
+
+    foreach ($yearCase in @(
+        @{ Name = 'negative-boundary'; Value = '-2147483648'; Expected = '-2147483648' },
+        @{ Name = 'positive-boundary'; Value = '+2147483647'; Expected = '2147483647' },
+        @{ Name = 'leading-zeroes'; Value = '00002026'; Expected = '2026' },
+        @{ Name = 'negative-zero'; Value = '-0000'; Expected = '0' },
+        @{ Name = 'decimal'; Value = '2.0'; Expected = '2' },
+        @{ Name = 'exponent'; Value = '1e3'; Expected = '1000' },
+        @{ Name = 'surrounding-whitespace'; Value = ' 2026 '; Expected = '2026' },
+        @{ Name = 'empty'; Value = ''; Expected = '0' },
+        @{ Name = 'decimal-round-even'; Value = '2.5'; Expected = '2' },
+        @{ Name = 'decimal-round-up'; Value = '3.5'; Expected = '4' }
+    )) {
+        $root = Join-Path $script:TempRoot "parser-year-$($yearCase.Name)"
+        Copy-Template -source $script:RepoRoot -destination $root
+        $result = Invoke-CapturedProcess `
+            $script:BashPath `
+            @('./scripts/init.sh', '--project-name', 'Parser.Contract', '--year', $yearCase.Value, '--keep-script') `
+            $root
+        Assert-ProcessSucceeded $result "POSIX parser accepted year $($yearCase.Value)"
+        $license = Get-Content -Raw (Join-Path $root 'LICENSE')
+        $escapedYear = [regex]::Escape($yearCase.Expected)
+        if ($license -notmatch "(?m)^Copyright \(c\) $escapedYear ") {
+            throw "POSIX parser did not canonicalize --year $($yearCase.Value) to $($yearCase.Expected)."
+        }
+
+        $powershellRoot = Join-Path $script:TempRoot "parser-year-powershell-$($yearCase.Name)"
+        Copy-Template -source $script:RepoRoot -destination $powershellRoot
+        $powershellResult = Invoke-CapturedProcess `
+            $script:PwshPath `
+            @('-NoProfile', '-File', './scripts/init.ps1', '-ProjectName', 'Parser.Contract', '-Year', $yearCase.Value, '-KeepScript') `
+            $powershellRoot
+        Assert-ProcessSucceeded $powershellResult "PowerShell parser accepted year $($yearCase.Value)"
+        $powershellLicense = Get-Content -Raw (Join-Path $powershellRoot 'LICENSE')
+        if ($powershellLicense -notmatch "(?m)^Copyright \(c\) $escapedYear ") {
+            throw "PowerShell parser did not canonicalize -Year $($yearCase.Value) to $($yearCase.Expected)."
+        }
+    }
+    Write-Host 'POSIX initializer parser checks passed.' -ForegroundColor Green
 }
 
 function Get-InitializerInvocation(
@@ -2561,7 +2679,7 @@ try {
         if (
             $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
             $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
-            $TomlOnly -or $SinglePassOnly -or $PathTokenOnly -or $HarnessPlanOnly
+            $TomlOnly -or $SinglePassOnly -or $PathTokenOnly -or $ParserOnly -or $HarnessPlanOnly
         ) {
             throw '-InternalSuite cannot be combined with a public focused selector'
         }
@@ -2572,7 +2690,7 @@ try {
     $hasPublicSelector = [bool](
         $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
         $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
-        $TomlOnly -or $SinglePassOnly -or $PathTokenOnly
+        $TomlOnly -or $SinglePassOnly -or $PathTokenOnly -or $ParserOnly
     )
     if (-not $hasPublicSelector) {
         Invoke-HarnessWorkers @(New-DefaultHarnessJobs)
@@ -2580,6 +2698,11 @@ try {
         Write-Host 'Initializer TOML basic-string parity checks passed.' -ForegroundColor Green
         Write-Host 'Initializer single-pass literal substitution checks passed.' -ForegroundColor Green
         Write-Host 'Initializer release-identity security checks passed.' -ForegroundColor Green
+        return
+    }
+
+    if ($ParserOnly) {
+        Test-PosixParserContract
         return
     }
 
