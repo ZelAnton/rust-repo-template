@@ -29,6 +29,8 @@
 # the value must be one non-empty portable filename component (no separators,
 # controls, Windows-invalid characters, or trailing space/dot). An unknown
 # token or unsafe value aborts before any mutation.
+# Every value-bearing option requires a value before another option; --year is
+# a signed decimal 32-bit integer, matching the PowerShell [int] contract.
 
 set -euo pipefail
 
@@ -42,14 +44,61 @@ keep_script=0
 
 die() { echo "error: $*" >&2; exit 1; }
 
+read_option_value() {
+  local option="$1"
+  if [ "$#" -lt 2 ]; then
+    die "$option requires a value. No files were changed."
+  fi
+  case "$2" in
+    -*)
+      if [ "$option" = "--year" ]; then
+        case "$2" in
+          --*|-h|-x) die "$option requires a value before option '$2'. No files were changed." ;;
+          *) ;;
+        esac
+      else
+        die "$option requires a value before option '$2'. No files were changed."
+      fi
+      ;;
+  esac
+  option_value="$2"
+}
+
+validate_year() {
+  local value="$1"
+  local normalized
+
+  # PowerShell's [int] binder first parses a numeric string, rounds a decimal
+  # value to the nearest Int32 (ties to even), and emits canonical decimal
+  # text. Keep that contract without relying on shell arithmetic overflow.
+  if ! normalized="$(LC_ALL=C TPL_YEAR="$value" awk '
+    function fail() { exit 1 }
+    BEGIN {
+      value = ENVIRON["TPL_YEAR"]
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (value == "") { print "0"; exit 0 }
+      gsub(/,/, "", value)
+      if (value !~ /^[+-]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$/) fail()
+      number = value + 0
+      if (number != number || number > 2147483648 || number < -2147483648) fail()
+      result = sprintf("%.0f", number)
+      if (result == "-0") result = "0"
+      if (result > 2147483647 || result < -2147483648) fail()
+      print result
+    }')"; then
+    die "invalid --year '$value'. Use a PowerShell-compatible signed numeric 32-bit integer. No files were changed."
+  fi
+  year="$normalized"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --project-name) project_name="${2:-}"; shift 2 ;;
-    --author)       author="${2:-}"; shift 2 ;;
-    --author-email) author_email="${2:-}"; shift 2 ;;
-    --github-owner) github_owner="${2:-}"; shift 2 ;;
-    --description)  description="${2:-}"; shift 2 ;;
-    --year)         year="${2:-}"; shift 2 ;;
+    --project-name) read_option_value "$@"; project_name="$option_value"; shift 2 ;;
+    --author)       read_option_value "$@"; author="$option_value"; shift 2 ;;
+    --author-email) read_option_value "$@"; author_email="$option_value"; shift 2 ;;
+    --github-owner) read_option_value "$@"; github_owner="$option_value"; shift 2 ;;
+    --description)  read_option_value "$@"; description="$option_value"; shift 2 ;;
+    --year)         read_option_value "$@"; validate_year "$option_value"; shift 2 ;;
     --keep-script)  keep_script=1; shift ;;
     -h|--help)      sed -n '2,24p' "$0"; exit 0 ;;
     *)              die "unknown argument: $1" ;;
