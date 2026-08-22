@@ -76,7 +76,8 @@ jobs:
       - name: Require main
         run: |
           if [ "${{ github.ref }}" != "refs/heads/main" ]; then
-            echo "::error::Releases must run from main (got '${{ github.ref }}'). Re-run with 'Use workflow from: main'."
+            echo "::error::Releases must run from main (got '${{ github.ref }}')." \
+              "Re-run with 'Use workflow from: main'."
             exit 1
           fi
 
@@ -98,7 +99,8 @@ jobs:
           TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           if [ -z "${TOKEN}" ]; then
-            echo "::error::CRATES_IO_TOKEN secret is not set. Add it under repo Settings → Secrets and variables → Actions before releasing."
+            echo "::error::CRATES_IO_TOKEN secret is not set." \
+              "Add it under repo Settings → Secrets and variables → Actions before releasing."
             exit 1
           fi
 
@@ -366,7 +368,8 @@ jobs:
             # run that uploaded but failed before tagging). Match cargo's actual
             # phrasings specifically — a broad "already exists" would risk a false
             # positive that tags an unpublished version.
-            if printf '%s' "$out" | grep -qiE 'crate version .* is already uploaded|already exists on [^[:space:]]*crates\.io index'; then
+            if printf '%s' "$out" | grep -qiE \
+              'crate version .* is already uploaded|already exists on [^[:space:]]*crates\.io index'; then
               echo "::notice::This version is already on crates.io — treating as published."
               break
             fi
@@ -416,7 +419,10 @@ jobs:
               gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" && break
             fi
             if [ "$attempt" -ge "$max" ]; then
-              echo "::error::${TAG} is PUBLISHED to crates.io and the tag is pushed, but creating the GitHub Release failed. Finish it by hand: gh release create ${TAG} --notes-file <notes>. Do NOT re-run this workflow — it would bump to the next version and strand ${TAG}'s release."
+              echo "::error::${TAG} is PUBLISHED to crates.io and the tag is pushed," \
+                "but creating the GitHub Release failed." \
+                "Finish it by hand: gh release create ${TAG} --notes-file <notes>." \
+                "Do NOT re-run this workflow — it would bump to the next version and strand ${TAG}'s release."
               exit 1
             fi
             echo "::warning::GitHub Release attempt ${attempt} failed; retrying in 15s..."
