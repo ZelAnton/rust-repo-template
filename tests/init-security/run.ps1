@@ -10,7 +10,8 @@ param(
     [switch]$DuplicateGitPathOnly,
     [switch]$ReleaseIdentityOnly,
     [switch]$TomlOnly,
-    [switch]$SinglePassOnly
+    [switch]$SinglePassOnly,
+    [switch]$PathTokenOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -586,6 +587,131 @@ function Invoke-SinglePassLiteralSubstitutionSuite {
         Test-SinglePassLiteralSubstitution $kind
     }
     Write-Host 'Initializer single-pass literal substitution checks passed.' -ForegroundColor Green
+}
+
+function Get-PathTokenReplacementValues {
+    [ordered]@{
+        ProjectName = 'path-token-security'
+        Author = 'Path Author'
+        AuthorEmail = 'path@example.com'
+        GitHubOwner = 'path-owner'
+        Description = 'path-description'
+        Year = '2026'
+    }
+}
+
+function Add-PathTokenFixtures([string]$copyRoot) {
+    Add-TextFixture `
+        $copyRoot `
+        '.initializer-path-tokens/__Author__-__AuthorEmail__/__GitHubOwner____Description____Year____ProjectName____ProjectName__.txt' `
+        'path-token fixture'
+}
+
+function Test-PathTokenRenames(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $values = Get-PathTokenReplacementValues
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-renames"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-PathTokenFixtures $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind path-token renames"
+
+    $expected = Join-Path `
+        $copyRoot `
+        '.initializer-path-tokens/Path Author-path@example.com/path-ownerpath-description2026path-token-securitypath-token-security.txt'
+    if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) {
+        throw "$kind initializer did not replace every supported token in nested, repeated, and adjacent path names"
+    }
+    foreach ($stalePath in @(
+        '.initializer-path-tokens/__Author__-__AuthorEmail__',
+        '.initializer-path-tokens/Path Author-path@example.com/__GitHubOwner____Description____Year____ProjectName____ProjectName__.txt'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $copyRoot $stalePath)) {
+            throw "$kind initializer retained stale token path $stalePath"
+        }
+    }
+}
+
+function Test-OpaquePathTokenReplacement(
+    [ValidateSet('powershell', 'posix')][string]$kind
+) {
+    $values = Get-PathTokenReplacementValues
+    $values.Description = 'opaque-__Author__-value'
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-opaque"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    Add-TextFixture $copyRoot '.initializer-path-tokens/opaque-__Description__.txt' 'opaque path fixture'
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    Assert-ProcessSucceeded $result "$kind opaque path-token replacement"
+    $expected = Join-Path $copyRoot '.initializer-path-tokens/opaque-opaque-__Author__-value.txt'
+    if (-not (Test-Path -LiteralPath $expected -PathType Leaf)) {
+        throw "$kind initializer rescanned an opaque path replacement value"
+    }
+}
+
+function Test-RejectedPathToken(
+    [ValidateSet('powershell', 'posix')][string]$kind,
+    [ValidateSet('unsafe-value', 'unknown-token')][string]$caseName
+) {
+    $values = Get-PathTokenReplacementValues
+    $copyRoot = Join-Path $script:TempRoot "$kind-path-token-reject-$caseName"
+    Copy-Template -source $script:RepoRoot -destination $copyRoot
+    if ($caseName -eq 'unsafe-value') {
+        Add-TextFixture $copyRoot '.initializer-path-tokens/__Description__.txt' 'unsafe path fixture'
+        $values.Description = 'unsafe/path'
+        $expectedDiagnostic = 'unsupported or unsafe path token'
+    } else {
+        Add-TextFixture $copyRoot '.initializer-path-tokens/__Unsupported_Token__.txt' 'unknown path fixture'
+        $expectedDiagnostic = 'unsupported path token'
+    }
+    $before = Get-TreeFingerprint $copyRoot
+    $invocation = Get-InitializerInvocation `
+        $kind $copyRoot $values.Author $values.AuthorEmail `
+        -ProjectName $values.ProjectName `
+        -GitHubOwner $values.GitHubOwner `
+        -Description $values.Description
+    $result = Invoke-CapturedProcess `
+        $invocation.FileName $invocation.Arguments $copyRoot $invocation.Environment
+    if ($result.ExitCode -eq 0) {
+        throw "$kind initializer accepted $caseName path-token input"
+    }
+    Assert-DiagnosticContains $result $expectedDiagnostic `
+        "$kind initializer returned an unclear $caseName path-token diagnostic"
+    Assert-DiagnosticContains $result 'no files were changed' `
+        "$kind initializer omitted the no-mutation guarantee for $caseName path-token rejection"
+    Assert-Equal `
+        (Get-TreeFingerprint $copyRoot) `
+        $before `
+        "$kind initializer mutated the tree before rejecting $caseName path-token input"
+}
+
+function Invoke-PathTokenSuite {
+    $fingerprints = [ordered]@{}
+    foreach ($kind in @('powershell', 'posix')) {
+        Test-PathTokenRenames $kind
+        Test-OpaquePathTokenReplacement $kind
+        Test-RejectedPathToken $kind 'unsafe-value'
+        Test-RejectedPathToken $kind 'unknown-token'
+        $fingerprints[$kind] = Get-TreeFingerprint `
+            (Join-Path $script:TempRoot "$kind-path-token-renames")
+    }
+    Assert-Equal `
+        $fingerprints.posix `
+        $fingerprints.powershell `
+        'PowerShell and POSIX initializers produced different path-token trees'
+    Write-Host 'Initializer path-token contract checks passed.' -ForegroundColor Green
 }
 
 function Assert-TemplateOnlySecurityArtifactsRemoved([string]$copyRoot, [string]$description) {
@@ -1953,12 +2079,12 @@ try {
     $hasNonTomlSelector = [bool](
         $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
         $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
-        $SinglePassOnly
+        $SinglePassOnly -or $PathTokenOnly
     )
     $hasNonSinglePassSelector = [bool](
         $CollisionOnly -or $RaceOnly -or $ReopenedOnly -or $ContentSafetyOnly -or
         $GitFileOnly -or $NoGitOnly -or $DuplicateGitPathOnly -or $ReleaseIdentityOnly -or
-        $TomlOnly
+        $TomlOnly -or $PathTokenOnly
     )
     $runTomlSuite = Test-ShouldRunTomlSuite `
         -tomlOnly:$TomlOnly `
@@ -1983,6 +2109,11 @@ try {
             throw 'Internal routing error: -SinglePassOnly did not select the single-pass regression suite'
         }
         Invoke-SinglePassLiteralSubstitutionSuite
+        return
+    }
+
+    if ($PathTokenOnly) {
+        Invoke-PathTokenSuite
         return
     }
 
@@ -2089,6 +2220,8 @@ try {
     if ($runSinglePassSuite) {
         Invoke-SinglePassLiteralSubstitutionSuite
     }
+
+    Invoke-PathTokenSuite
 
     Test-PowerShellDuplicateGitPathDiscovery
 

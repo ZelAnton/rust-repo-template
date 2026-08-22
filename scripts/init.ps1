@@ -20,6 +20,12 @@
     Omitted optional values fall back to sensible defaults so the result always
     builds; edit LICENSE / Cargo.toml afterwards if you need to refine them.
 
+    Path names use the same six-token contract as file contents. Each token is
+    matched once against the original name and replaced with its opaque value;
+    the value must be one non-empty portable filename component (no separators,
+    controls, Windows-invalid characters, or trailing space/dot). An unknown
+    token or unsafe value aborts before any mutation.
+
 .PARAMETER ProjectName
     Project name. Required. A crates.io-legal crate name is *derived* from it
     (lowercased, runs of non-alphanumerics collapsed to '-', leading/trailing
@@ -322,6 +328,10 @@ $templateTokenPattern = [Text.RegularExpressions.Regex]::new(
     '__(?:ProjectName|Author|AuthorEmail|GitHubOwner|Description|Year)__',
     [Text.RegularExpressions.RegexOptions]::CultureInvariant
 )
+$anyPathTokenPattern = [Text.RegularExpressions.Regex]::new(
+    '__(?<Token>.+?)__',
+    [Text.RegularExpressions.RegexOptions]::CultureInvariant
+)
 
 function Expand-TemplateTokensSinglePass(
     [AllowEmptyString()][string]$text,
@@ -343,6 +353,65 @@ function Expand-TemplateTokensSinglePass(
         $cursor = $match.Index + $match.Length
     }
     [void]$expanded.Append($text, $cursor, $text.Length - $cursor)
+    $expanded.ToString()
+}
+
+function Assert-SafePathReplacement(
+    [string]$token,
+    [AllowEmptyString()][string]$value,
+    [string]$relativeSource
+) {
+    # Keep this deliberately portable: a template initialized on POSIX must
+    # not create a name that Windows cannot represent, and vice versa.
+    $unsafe = [string]::IsNullOrEmpty($value) -or
+        $value -match '[\x00-\x1F\x7F/\\<>:"|?*]' -or
+        $value.EndsWith(' ', [StringComparison]::Ordinal) -or
+        $value.EndsWith('.', [StringComparison]::Ordinal) -or
+        $value -in @('.', '..') -or
+        $value -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$'
+    if (-not $unsafe) {
+        for ($index = 0; $index -lt $value.Length; $index++) {
+            $character = $value[$index]
+            if ([char]::IsHighSurrogate($character)) {
+                if ($index + 1 -ge $value.Length -or
+                    -not [char]::IsLowSurrogate($value[$index + 1])) {
+                    $unsafe = $true
+                    break
+                }
+                $index++
+            } elseif ([char]::IsLowSurrogate($character)) {
+                $unsafe = $true
+                break
+            }
+        }
+    }
+    if ($unsafe) {
+        throw "unsupported or unsafe path token '$token' in '$relativeSource': replacement must be a non-empty portable filename component (no separators, controls, Windows-invalid characters, or trailing space/dot); no files were changed."
+    }
+}
+
+function Expand-PathNameSinglePass([string]$name, [string]$relativeSource) {
+    # Enumerate every token from the untouched source name. Replacement values
+    # are appended as opaque output and are never scanned a second time.
+    $allMatches = $anyPathTokenPattern.Matches($name)
+    foreach ($match in $allMatches) {
+        if (-not $replacements.Contains($match.Value)) {
+            throw "unsupported path token '$($match.Value)' in '$relativeSource'; supported tokens are __ProjectName__, __Author__, __AuthorEmail__, __GitHubOwner__, __Description__, __Year__; no files were changed."
+        }
+    }
+    if ($allMatches.Count -eq 0) {
+        return $name
+    }
+
+    $expanded = [Text.StringBuilder]::new($name.Length)
+    $cursor = 0
+    foreach ($match in $allMatches) {
+        Assert-SafePathReplacement $match.Value ([string]$replacements[$match.Value]) $relativeSource
+        [void]$expanded.Append($name, $cursor, $match.Index - $cursor)
+        [void]$expanded.Append([string]$replacements[$match.Value])
+        $cursor = $match.Index + $match.Length
+    }
+    [void]$expanded.Append($name, $cursor, $name.Length - $cursor)
     $expanded.ToString()
 }
 
@@ -545,11 +614,16 @@ if ($unsafeEntries.Count -gt 0) {
 }
 
 # Deepest paths run first so child renames do not invalidate parent sources.
-# Ordinal relative-path ordering makes equal-depth plans reproducible.
+# Ordinal relative-path ordering makes equal-depth plans reproducible. Every
+# advertised token is expanded from the original name; unknown tokens and
+# unsafe replacement values fail this preflight before content is staged.
 $renamePlan = [Collections.Generic.List[object]]::new()
-foreach ($item in ($repositoryItems | Where-Object { $_.Name.Contains('__ProjectName__') })) {
+foreach ($item in $repositoryItems) {
     $relativeSource = Get-RelativeDisplayPath $item.FullName
-    $newName = $item.Name.Replace('__ProjectName__', $crateSafe)
+    $newName = Expand-PathNameSinglePass $item.Name $relativeSource
+    if ($newName -ceq $item.Name) {
+        continue
+    }
     $destination = Join-Path (Split-Path -Parent $item.FullName) $newName
     $renamePlan.Add([pscustomobject]@{
         Source = $item.FullName

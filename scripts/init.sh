@@ -23,6 +23,12 @@
 # casing). The slug must start with a letter (cargo rejects a leading digit; init
 # errors if it does not). Name your GitHub repo with the slug, or edit Cargo.toml
 # / LICENSE to refine.
+#
+# Path names use the same six-token contract as file contents. Each token is
+# matched once against the original name and replaced with its opaque value;
+# the value must be one non-empty portable filename component (no separators,
+# controls, Windows-invalid characters, or trailing space/dot). An unknown
+# token or unsafe value aborts before any mutation.
 
 set -euo pipefail
 
@@ -84,6 +90,59 @@ fi
 [ -n "$github_owner" ] || github_owner="your-org"
 [ -n "$description" ]  || description="TODO: crate description"
 [ -n "$year" ]         || year="$(date +%Y)"
+
+supported_path_tokens='__ProjectName__ __Author__ __AuthorEmail__ __GitHubOwner__ __Description__ __Year__'
+
+is_safe_path_replacement() {
+  path_value="$1"
+  [ -n "$path_value" ] || return 1
+  [ "$path_value" != "." ] && [ "$path_value" != ".." ] || return 1
+  case "$path_value" in
+    *[[:cntrl:]]*|*'/'*|*\\*|*'<'*|*'>'*|*':'*|*'"'*|*'|'*|*'?'*|*'*'*|*' '|*.) return 1 ;;
+  esac
+  case "$path_value" in
+    [cC][oO][nN]|[cC][oO][nN].*|[pP][rR][nN]|[pP][rR][nN].*|[aA][uU][xX]|[aA][uU][xX].*|[nN][uU][lL]|[nN][uU][lL].*|[cC][oO][mM][1-9]|[cC][oO][mM][1-9].*|[lL][pP][tT][1-9]|[lL][pP][tT][1-9].*) return 1 ;;
+  esac
+  return 0
+}
+
+path_replacement_for() {
+  case "$1" in
+    __ProjectName__) path_replacement_value="$crate_name" ;;
+    __Author__) path_replacement_value="$author" ;;
+    __AuthorEmail__) path_replacement_value="$author_email" ;;
+    __GitHubOwner__) path_replacement_value="$github_owner" ;;
+    __Description__) path_replacement_value="$description" ;;
+    __Year__) path_replacement_value="$year" ;;
+    *) return 1 ;;
+  esac
+}
+
+expand_path_name_single_pass() {
+  path_name_input="$1"
+  path_name_source="$2"
+  path_name_output=""
+  path_name_remainder="$path_name_input"
+  path_name_unchecked="$path_name_input"
+  while [[ "$path_name_unchecked" =~ (__ProjectName__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__) ]]; do
+    path_name_unchecked="${path_name_unchecked#*"${BASH_REMATCH[1]}"}"
+  done
+  if [[ "$path_name_unchecked" =~ (__.+__) ]]; then
+    path_name_token="${BASH_REMATCH[1]}"
+    die "unsupported path token '$path_name_token' in '$path_name_source'; supported tokens are $supported_path_tokens; no files were changed."
+  fi
+  while [[ "$path_name_remainder" =~ (__ProjectName__|__Author__|__AuthorEmail__|__GitHubOwner__|__Description__|__Year__) ]]; do
+    path_name_token="${BASH_REMATCH[1]}"
+    path_name_prefix="${path_name_remainder%%"$path_name_token"*}"
+    path_replacement_for "$path_name_token" ||
+      die "unsupported path token '$path_name_token' in '$path_name_source'; supported tokens are $supported_path_tokens; no files were changed."
+    is_safe_path_replacement "$path_replacement_value" ||
+      die "unsupported or unsafe path token '$path_name_token' in '$path_name_source': replacement must be a non-empty portable filename component (no separators, controls, Windows-invalid characters, or trailing space/dot); no files were changed."
+    path_name_output+="$path_name_prefix$path_replacement_value"
+    path_name_remainder="${path_name_remainder#*"$path_name_token"}"
+  done
+  path_name_expanded="$path_name_output$path_name_remainder"
+}
 
 validate_release_identity() {
   case "$2" in
@@ -333,26 +392,25 @@ while IFS= read -r -d '' item; do
   fi
 
   base="${item##*/}"
-  case "$base" in
-    *__ProjectName__*)
-      dir="${item%/*}"
-      newbase="${base//__ProjectName__/$crate_name}"
-      destination="$dir/$newbase"
-      destination_relative="${destination#"$repo_root"/}"
-      depth=0
-      depth_tail="$source_relative"
-      while [[ "$depth_tail" == */* ]]; do
-        depth_tail="${depth_tail#*/}"
-        depth=$((depth + 1))
-      done
-      rename_sources[rename_count]="$item"
-      rename_destinations[rename_count]="$destination"
-      rename_source_relatives[rename_count]="$source_relative"
-      rename_destination_relatives[rename_count]="$destination_relative"
-      rename_depths[rename_count]="$depth"
-      rename_count=$((rename_count + 1))
-      ;;
-  esac
+  expand_path_name_single_pass "$base" "$source_relative"
+  newbase="$path_name_expanded"
+  if [[ "$newbase" != "$base" ]]; then
+    dir="${item%/*}"
+    destination="$dir/$newbase"
+    destination_relative="${destination#"$repo_root"/}"
+    depth=0
+    depth_tail="$source_relative"
+    while [[ "$depth_tail" == */* ]]; do
+      depth_tail="${depth_tail#*/}"
+      depth=$((depth + 1))
+    done
+    rename_sources[rename_count]="$item"
+    rename_destinations[rename_count]="$destination"
+    rename_source_relatives[rename_count]="$source_relative"
+    rename_destination_relatives[rename_count]="$destination_relative"
+    rename_depths[rename_count]="$depth"
+    rename_count=$((rename_count + 1))
+  fi
 done < "$inventory_manifest"
 
 if ((unsafe_count > 0)); then
@@ -377,6 +435,8 @@ done
 
 # Deepest sources run first; equal-depth paths use lexical order. This mirrors
 # init.ps1 and prevents a parent rename from invalidating an unprocessed child.
+# Every advertised token is expanded from the original name; unknown tokens and
+# unsafe replacement values fail this preflight before content is staged.
 for ((i = 1; i < rename_count; i++)); do
   key_source="${rename_sources[i]}"
   key_destination="${rename_destinations[i]}"
