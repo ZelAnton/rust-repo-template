@@ -98,10 +98,19 @@ is_safe_path_replacement() {
   [ -n "$path_value" ] || return 1
   [ "$path_value" != "." ] && [ "$path_value" != ".." ] || return 1
   case "$path_value" in
-    *[[:cntrl:]]*|*'/'*|*\\*|*'<'*|*'>'*|*':'*|*'"'*|*'|'*|*'?'*|*'*'*|*' '|*.) return 1 ;;
+    *[[:cntrl:]]*|*'/'*|*\\*|*'<'*|*'>'*|*':'*|*'"'*|*'|'*|*'?'*|*'*'*) return 1 ;;
   esac
+  # Leading and internal spaces are portable; only a trailing space or dot is
+  # rejected because Windows trims those characters from path components.
   case "$path_value" in
-    [cC][oO][nN]|[cC][oO][nN].*|[pP][rR][nN]|[pP][rR][nN].*|[aA][uU][xX]|[aA][uU][xX].*|[nN][uU][lL]|[nN][uU][lL].*|[cC][oO][mM][1-9]|[cC][oO][mM][1-9].*|[lL][pP][tT][1-9]|[lL][pP][tT][1-9].*) return 1 ;;
+    *' '|*.) return 1 ;;
+  esac
+  # Device names are reserved only when they are the complete basename. An
+  # optional dot extension is part of the same basename contract, so CON.foo
+  # is unsafe while CONtext and COM10 remain valid values.
+  path_reserved_base="${path_value%%.*}"
+  case "$path_reserved_base" in
+    [cC][oO][nN]|[pP][rR][nN]|[aA][uU][xX]|[nN][uU][lL]|[cC][oO][mM][1-9]|[lL][pP][tT][1-9]) return 1 ;;
   esac
   return 0
 }
