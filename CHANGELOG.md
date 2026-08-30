@@ -15,7 +15,7 @@ to a dated version section.
 - Initial project skeleton.
 
 ### Changed
--
+- The template and generated-repository guidance now use Git directly without secondary version-control metadata.
 
 ### Fixed
 -

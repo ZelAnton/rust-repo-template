@@ -17,11 +17,11 @@ metadata in.
   documented `[dependencies]` section. No crates are pre-fixed.
 - **`AGENTS.md`** + **`CLAUDE.md`** — guidance for AI coding agents: build/test
   commands, code-style and dependency conventions, the changelog process, and
-  the jujutsu (`jj`) version-control workflow.
+  the Git version-control workflow.
 - **`.claude/`** — shared Claude Code settings (`settings.json.template`, activated
   by `scripts/init.ps1`/`init.sh`) granting sane permissions for `cargo` commands.
-- **`.gitattributes`** — LF line-ending normalization (keeps git and colocated
-  `jj` agreeing on the working copy, especially on Windows).
+- **`.gitattributes`** — LF line-ending normalization for consistent Git working
+  copies, especially on Windows.
 - **`.editorconfig`** — editor defaults (LF, final newline, trim trailing) for
   the non-Rust files rustfmt doesn't touch (`.toml`, `.yml`, `.md`, `.sh`).
 - **`.gitignore`** — `/target`, per-user scratch files, and the `.claude/`
@@ -79,4 +79,4 @@ doesn't repeat it.
 
 See [AGENTS.md](AGENTS.md) for the full set: code style, dependency management
 (every dependency gets a "why" comment; no fixed allow-list), the changelog
-process, and the `jj` version-control workflow.
+process, and the Git version-control workflow.

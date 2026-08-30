@@ -46,11 +46,6 @@ git add .gitignore                                # stage the .gitignore edits a
 git commit -m "chore: keep agent instructions local-only"
 ```
 
-In a **jj-colocated** repo, drop the `git` commands and run `jj file untrack
-AGENTS.md CLAUDE.md .claude` instead (it folds into the working-copy commit, so
-there's no separate commit step). `jj file untrack` only accepts paths that are
-*already* ignored, so add the `.gitignore` lines above first.
-
 Do this **before the first push**: a repo created via GitHub's *Use this
 template* already has these files in its initial commit, so untracking keeps
 them out of *later* commits only — whatever was already pushed remains in
@@ -162,44 +157,17 @@ committed.
 
 ## Version control workflow
 
-This repo uses [jujutsu (`jj`)](https://jj-vcs.github.io/jj/) colocated with
-git. Use `jj` commands; the canonical workflow:
+This repo uses Git directly. Do not initialize or colocate another version-control system in the working tree.
 
-- **Per-prompt evaluation (mandatory).** Before any edits, run `jj st` and
-  classify the incoming prompt against the current change description:
-
-	| Signal in prompt | Category | Action |
-	|---|---|---|
-	| Same topic, refinement, follow-up of in-progress work | **Continuation** | Just work. jj auto-folds edits into the current change. |
-	| Same change but goal has been refined or expanded | **Scope shift** | `jj describe -m "<refined summary>"`. **Don't** start a new change. |
-	| Orthogonal topic, different area, "теперь сделай X" | **New work** | If current change is finished → `jj new -m "<summary>"` (descendant). If still in progress → `jj new @- -m "..."` (parallel sibling). |
-
-	Reliable signals: word changes like "теперь" / "now" / "next" / "также сделай" / "and also" usually mean **new work** or **scope shift**. Imperative follow-ups inside the same scope ("исправь это", "fix this", "продолжи") mean **continuation**. When in doubt, ask the user.
-
-- **Describe early.** When starting a new piece of work, immediately set the change description:
-	```
-	jj describe -m "Concise summary"
-	```
-	The description should reflect intent *before* the work — not be backfilled at commit time. Keep extending the same `jj` change for follow-ups; don't spawn one per edit.
-- **Sync on the user's trigger.** When the user says `pull` (or `push`/`sync`), run the full handshake:
-	1. `jj git fetch` first — picks up any remote movement (merged PRs, CI release commits, etc.).
-	2. Rebase if `main@origin` advanced: `jj rebase -r @- -d main@origin` (or `jj rebase -d main@origin` for a stack).
-	3. Put the work on a **feature bookmark**, not `main`: `jj bookmark create <topic> -r @` the first time (then `jj bookmark move <topic> --to @` as it grows), and push only it: `jj git push --allow-new -b <topic>`.
-	4. Open a pull request into `main` (`gh pr create --base main --head <topic> --fill`, or via the GitHub UI). `main` advances only when that PR merges; afterwards `jj git fetch` brings the merge down and you `jj bookmark delete <topic>`.
-
-	Never push without an explicit signal from the user. **Direct-push fallback:** where `main` is *not* protected, the old flow still works — `jj bookmark move main --to @` then `jj git push -b main`. Once branch protection requires PRs, a direct push to `main` is rejected for everyone except the release workflow's GitHub App, which sits in the ruleset's bypass list (`RELEASE_APP_ID` + `RELEASE_APP_PRIVATE_KEY`; see `release-token-bypass.md`).
-- **Undoing dropped work.** When the user decides to abandon something already done, reach for `jj`'s safety net rather than hand-cleanup:
-	- `jj undo` (alias of `jj op undo`) reverses the last operation — describe, edit, squash, rebase, abandon, push, all of it. Repeatable.
-	- `jj abandon <rev>` drops a specific change entirely; descendants auto-rebase.
-	- `jj restore` discards working-copy edits back to the parent's tree.
-	- `jj op log` is the full reflog if you need to go further back via `jj op restore <op-id>`.
-- **Feature bookmarks are the unit of work** — one per PR, short kebab-case topic name. Don't advance `main` locally to publish; `main` moves only via merged PRs and the release workflow's tagged commit. (Previously work lived directly on `main`; branch protection requiring PRs makes direct push the exception — see the fallback above.)
+- **Inspect before editing:** run `git status --short --branch`, preserve existing work, and keep follow-ups for the same task on the current feature branch.
+- **Separate unrelated work:** do not mix unrelated changes in one branch or commit. If the working tree is dirty, ask before stashing, switching branches, or creating another worktree.
+- **Sync on the user's trigger:** run `git fetch origin`, rebase the feature branch onto `origin/main` when needed, push it with `git push --set-upstream origin HEAD` on the first push, and open a pull request into `main`. Never push without an explicit signal.
+- **Direct-push fallback:** where `main` is unprotected, `git push origin HEAD:main` remains available; once pull requests are required this is rejected for everyone except an automated actor granted a bypass.
+- **Undo deliberately:** use `git restore` for uncommitted changes, `git revert` for published commits, and `git reflog` for recovery. Do not rewrite published history without explicit approval.
+- **Feature branches are the unit of work** (short kebab-case topic per pull request). Do not advance `main` locally to publish; it moves through merged pull requests and the release workflow.
 
 ## Windows / line endings
 
 The working tree may carry CRLF line endings on Windows despite `.gitattributes`
 mandating LF — that's stat-cache state from a pre-attributes checkout, not actual
-file divergence. The committed blobs are LF; pushed commits are clean. Colocated
-`jj st` may show phantom modifications for files that haven't been re-extracted
-since `.gitattributes` was added. `.gitattributes` (`* text=auto eol=lf`) is what
-keeps git and jj agreeing on the working copy.
+file divergence. The committed blobs are LF and pushed commits are clean.

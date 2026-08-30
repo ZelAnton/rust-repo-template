@@ -59,7 +59,7 @@ Confirm these facts by reading, not by assuming:
     `CRATES_IO_TOKEN` secret).
   - LF line endings via `.gitattributes` (`* text=auto eol=lf`); `.editorconfig`
     covers editor defaults for non-Rust files.
-- It uses **jujutsu (`jj`)** colocated with git. Drive VCS through `jj`.
+- It uses **Git** directly with a feature-branch and pull-request workflow.
 
 ## The happy path (standard single-crate init)
 
@@ -128,11 +128,6 @@ Confirm these facts by reading, not by assuming:
       git commit -m "chore: keep agent instructions local-only"
       ```
 
-      In a **jj-colocated** repo, use `jj file untrack AGENTS.md CLAUDE.md
-      .claude` instead of the `git` commands (it folds into the working-copy
-      commit). Order matters: `jj file untrack` only drops paths already matched
-      by an ignore rule, so do step 1 first.
-
    From then on, edits to these files are neither staged nor pushed. **Do this
    before the first push:** a repo created via GitHub's *Use this template*
    already carries these files in its initial commit, so untracking keeps them
@@ -180,8 +175,8 @@ Whatever you change, update `AGENTS.md` so it describes the layout you produced.
 - **READMEs are plain markdown, not rustdoc.** Don't use rustdoc hidden-line `#`
   prefixes (e.g. `# Ok::<(), _>(())`) in a README — they render *literally* on
   GitHub/crates.io. Use plain ```` ```rust ```` fences.
-- **VCS.** The repo is jj-colocated. Use `jj` commands; if you must use raw git,
-  follow with `jj git import`.
+- **VCS.** The repo uses Git directly. Keep each task on a focused feature branch
+  and publish it through a pull request into `main`.
 
 ## Updating this guide
 

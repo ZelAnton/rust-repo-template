@@ -94,10 +94,6 @@ an MIT `LICENSE`, and conventions for agents in [CLAUDE.md](CLAUDE.md) /
    git commit -m "chore: keep agent instructions local-only"
    ```
 
-   In a **jj-colocated** repo, run `jj file untrack AGENTS.md CLAUDE.md .claude`
-   instead (no separate commit needed) — add the `.gitignore` lines first, as
-   `jj file untrack` only drops paths that are already ignored.
-
    Do this **before your first push**. A repo created via GitHub's *Use this
    template* already has these files in its initial commit, so untracking keeps
    them out of *later* commits only — anything already pushed stays in history.
