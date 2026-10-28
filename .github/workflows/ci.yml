@@ -23,7 +23,7 @@ jobs:
       # SHA and updates the comment on its weekly run.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           # Match the interpreter used to resolve the hashed CI tooling lock.
           python-version: '3.14'
@@ -72,7 +72,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@stable # rolling toolchain selector — intentionally unpinned
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo build --all-targets
       - run: cargo test
 
@@ -114,5 +114,5 @@ jobs:
       # rust-toolchain.toml tracks stable and would otherwise win here; remove it
       # so cargo uses the 1.85 toolchain installed above and truly tests the floor.
       - run: rm -f rust-toolchain.toml
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
       - run: cargo check --all-targets
